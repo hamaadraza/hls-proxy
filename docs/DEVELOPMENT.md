@@ -13,6 +13,8 @@ than linking a system TLS library.
 | macOS | `xcode-select --install && brew install cmake` |
 | Windows | Visual Studio with the C++ workload, plus cmake, LLVM and NASM (see below) |
 
+Jump to [Releasing](#releasing) if that is what you came for.
+
 ```bash
 git clone https://github.com/hamaadraza/hls-proxy.git
 cd hls-proxy
@@ -160,16 +162,62 @@ Windows CI installs NASM, so the assembly build path is exercised there too.
 
 ## Releasing
 
-[`.github/workflows/release.yml`](../.github/workflows/release.yml) builds every
-target on a native runner and publishes the archives.
+Pushing a `v*` tag is what triggers a release —
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) then builds
+every target on a native runner and publishes the archives.
 
-```bash
-git tag v0.1.0
-git push origin v0.1.0
+### Cutting a release
+
+**1. Bump the version in [`Cargo.toml`](../Cargo.toml)** so it matches the tag
+you are about to push:
+
+```toml
+[package]
+version = "0.2.0"
 ```
 
-That produces `.tar.gz` (Linux/macOS) and `.zip` (Windows) archives, each with a
-`.sha256` checksum, attached to a GitHub Release with generated notes.
+This step is easy to forget and nothing enforces it. The tag names the archives,
+but `Cargo.toml` is what gets compiled into the binary, so skipping it ships a
+`v0.2.0` archive containing a binary that still calls itself `0.1.0`.
+
+**2. Commit the bump** (`Cargo.lock` updates too, and the release build uses
+`--locked`, so it must be committed):
+
+```bash
+cargo check                     # refreshes Cargo.lock
+git add Cargo.toml Cargo.lock
+git commit -m "Release v0.2.0"
+git push
+```
+
+**3. Tag and push the tag:**
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+That is the step that actually starts the release. Watch it under the repository's
+**Actions → Release** tab.
+
+### What you get
+
+`.tar.gz` (Linux/macOS) and `.zip` (Windows) archives, each with a `.sha256`
+checksum, attached to a GitHub Release with generated notes. Each archive
+contains the binary, `README.md`, `.env.example`, `LICENSE` and `docs/`.
+
+### Fixing a bad release
+
+Tags are just pointers, so a mistake is recoverable. Delete both the remote and
+local tag, then re-tag:
+
+```bash
+git push origin :refs/tags/v0.2.0
+git tag -d v0.2.0
+```
+
+Delete the GitHub Release too (the workflow uploads with `--clobber`, so a
+re-run would otherwise add files to the existing release rather than replace it).
 
 | Target | Runner |
 |---|---|

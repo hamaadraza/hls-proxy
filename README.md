@@ -75,6 +75,11 @@ Download a binary from the
 Every archive ships a `.sha256` checksum. Linux builds target glibc 2.35
 (Ubuntu 22.04) for broad compatibility.
 
+> Archive names use Rust's `arch-vendor-os-abi` target naming. `unknown` is just
+> the vendor field for platforms without a single vendor, so
+> `x86_64-unknown-linux-gnu` means "64-bit Linux, glibc" — the right choice for
+> almost every Linux server. `aarch64` is 64-bit ARM.
+
 Or build it yourself — see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md):
 
 ```bash
@@ -223,6 +228,19 @@ warnings`, so run this before pushing:
 ```bash
 cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test
 ```
+
+## Releasing
+
+Bump `version` in [Cargo.toml](Cargo.toml), commit it, then push a `v*` tag —
+that tag is what triggers the release build:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+Binaries for all six platforms are built on native runners and attached to a
+GitHub Release automatically. Full checklist, including how to undo a bad tag:
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#releasing).
 
 ## License
 
