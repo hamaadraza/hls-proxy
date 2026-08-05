@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# Cancel superseded runs on the same branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Format & clippy
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # wreq builds BoringSSL from source and bindgen needs libclang.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang libclang-dev
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang libclang-dev
+
+      # NASM is not preinstalled on the Windows images. Installing it is what
+      # lets cmake/boringssl-asm-fallback.cmake pick the fast assembly backend.
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install nasm -y --no-progress
+          echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
+
+      - name: Point bindgen at LLVM (Windows)
+        if: runner.os == 'Windows'
+        run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+
+      - name: cargo test
+        run: cargo test --all-targets
+
+      # Proves the release binary actually starts and serves, which a unit
+      # test cannot cover.
+      - name: Smoke test the binary
+        shell: bash
+        run: |
+          cargo build
+          PORT=8123 ./target/debug/hls-proxy${{ runner.os == 'Windows' && '.exe' || '' }} &
+          SERVER_PID=$!
+          for i in $(seq 1 30); do
+            curl -sf -o /dev/null "http://127.0.0.1:8123/" && break
+            sleep 1
+          done
+          RESPONSE=$(curl -sf "http://127.0.0.1:8123/encode?url=https://example.com/a.m3u8&header=Referer:https://example.com/")
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep -q '"url"'
+          kill $SERVER_PID
