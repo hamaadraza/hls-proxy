@@ -1,0 +1,14 @@
+version: 2
+updates:
+  # wreq/wreq-util track browser releases closely, so staying current here is
+  # what keeps the emulated fingerprints matching real Chrome.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly

@@ -1,0 +1,10 @@
+# Points BoringSSL's cmake build at a shim that uses the fast assembly backend
+# whenever NASM is available, and falls back to portable C only when it is not.
+# See cmake/boringssl-asm-fallback.cmake for the details.
+#
+# Note for cross-compilation: boring-sys2 skips its own cross-compile cmake
+# setup when CMAKE_TOOLCHAIN_FILE is set, so remove this section if you build
+# for a target other than your host. The release workflow avoids the issue by
+# building every target on a native runner.
+[env]
+CMAKE_TOOLCHAIN_FILE = { value = "cmake/boringssl-asm-fallback.cmake", relative = true }
