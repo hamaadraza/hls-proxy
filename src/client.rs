@@ -1,9 +1,12 @@
+use crate::payload::validate_upstream;
 use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::Duration;
 use wreq::redirect::Policy;
 use wreq::Client;
 use wreq_util::{Emulation, EmulationOS, EmulationOption};
+
+const MAX_REDIRECTS: usize = 10;
 
 /// Which browser and platform an upstream request should present as.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -78,6 +81,27 @@ pub fn parse_emulation_os(name: &str) -> Result<EmulationOS, String> {
     )
 }
 
+/// The SSRF guard runs on the URL in the token, but redirects are followed
+/// inside the client where that check cannot see them. Without re-checking each
+/// hop, an origin could answer with a 302 to `http://127.0.0.1:6379/` and the
+/// guard would be bypassed completely rather than partially.
+///
+/// A custom policy replaces the built-in hop limit, so it has to enforce its own.
+fn guarded_redirect_policy() -> Policy {
+    Policy::custom(|attempt| {
+        if attempt.previous().len() >= MAX_REDIRECTS {
+            return attempt.error(format!("exceeded {MAX_REDIRECTS} redirects"));
+        }
+        match validate_upstream(attempt.url()) {
+            Ok(()) => attempt.follow(),
+            Err(err) => {
+                tracing::warn!(url = %attempt.url(), "blocked redirect to disallowed host");
+                attempt.error(format!("redirect blocked: {err}"))
+            }
+        }
+    })
+}
+
 fn build_client(profile: &Profile) -> Result<Client, String> {
     let emulation = EmulationOption::builder()
         .emulation(parse_emulation(&profile.browser)?)
@@ -86,7 +110,7 @@ fn build_client(profile: &Profile) -> Result<Client, String> {
 
     Client::builder()
         .emulation(emulation)
-        .redirect(Policy::limited(10))
+        .redirect(guarded_redirect_policy())
         .connect_timeout(Duration::from_secs(15))
         .pool_idle_timeout(Duration::from_secs(90))
         .build()
@@ -109,6 +133,47 @@ mod tests {
     fn rejects_unknown_profiles() {
         assert!(parse_emulation("netscape_4").is_err());
         assert!(parse_emulation_os("solaris").is_err());
+    }
+
+    /// The initial URL is validated by the proxy layer, but redirects are
+    /// followed inside the client where that check cannot reach. Serve a real
+    /// redirect pointing at loopback and confirm the client refuses to follow it.
+    #[tokio::test]
+    async fn refuses_to_follow_redirects_to_blocked_hosts() {
+        let app = axum::Router::new()
+            .route(
+                "/hop",
+                axum::routing::get(|| async {
+                    axum::response::Redirect::temporary("http://127.0.0.1:9/secret")
+                }),
+            )
+            .route("/direct", axum::routing::get(|| async { "reached" }));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = build_client(&Profile {
+            browser: "chrome_137".to_string(),
+            os: "windows".to_string(),
+        })
+        .unwrap();
+
+        let err = client
+            .get(format!("http://{addr}/hop"))
+            .send()
+            .await
+            .expect_err("redirect to loopback must not be followed");
+        assert!(err.is_redirect(), "expected a redirect error, got {err:?}");
+
+        // The guard applies to redirect targets only; a direct request to the
+        // same host is still the proxy layer's call, not the client's.
+        let ok = client
+            .get(format!("http://{addr}/direct"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200);
     }
 
     #[test]

@@ -198,10 +198,13 @@ casual reuse.
 you will break playback. Per-IP connection limits tend to work better than
 request-rate limits.
 
-**Limit egress.** The SSRF guard only rejects private *IP literals*; a hostname
-that resolves to an internal address is still fetched. If the proxy runs
-somewhere with access to internal services, restrict its outbound network at the
-firewall rather than relying on the guard.
+**Limit egress.** The SSRF guard rejects reserved *IP literals* — loopback,
+private, link-local (including cloud metadata at `169.254.169.254`), carrier-NAT
+and reserved ranges, in both IPv4 and IPv6 including IPv4-mapped forms — and it
+re-checks every redirect hop. What it cannot catch is a hostname that resolves to
+an internal address, because resolution happens inside the HTTP client. If the
+proxy runs somewhere with access to internal services, restrict its outbound
+network at the firewall rather than relying on the guard.
 
 ## Scaling
 

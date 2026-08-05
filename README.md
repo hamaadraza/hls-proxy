@@ -205,9 +205,22 @@ payload and use your bandwidth as an open proxy. Keep it on a private network,
 put an authenticating reverse proxy in front of it, or restrict access at the
 firewall before exposing it publicly.
 
-The SSRF guard rejects loopback and private *IP literals*, but a hostname that
-resolves to a private address will still be fetched, because resolution happens
-inside the HTTP client. Do not treat this as a hard boundary.
+The SSRF guard rejects loopback, private, link-local (including cloud metadata
+at `169.254.169.254`), carrier-NAT and reserved addresses. It understands IPv4
+and IPv6, including IPv4-mapped forms like `[::ffff:127.0.0.1]` that name an
+IPv4 address in IPv6 syntax, and it blocks the name `localhost`. Every redirect
+hop is checked too, not just the URL in the token, so an origin cannot answer
+with a `302` to a private address.
+
+**It is still not a hard boundary.** A hostname that resolves to a private
+address is fetched, because resolution happens inside the HTTP client where this
+check cannot see it. Restrict egress at the network level if that matters — see
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#hardening).
+
+Proxied responses are returned with `Content-Security-Policy: sandbox` and
+`X-Content-Type-Options: nosniff`. Without them, anyone could point the proxy at
+an HTML page and have it served from *your* domain, which would run script on
+your origin.
 
 See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#hardening) for ways to lock it down.
 

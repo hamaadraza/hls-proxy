@@ -77,7 +77,10 @@ impl std::fmt::Display for PayloadError {
             PayloadError::BadUrl => write!(f, "payload contains an invalid url"),
             PayloadError::BadScheme => write!(f, "only http and https urls are supported"),
             PayloadError::BlockedHost => {
-                write!(f, "upstream host is a private or loopback address")
+                write!(
+                    f,
+                    "upstream host is a private, loopback or otherwise reserved address"
+                )
             }
         }
     }
@@ -86,21 +89,55 @@ impl std::fmt::Display for PayloadError {
 /// Best-effort SSRF guard. It only inspects IP literals — a hostname that
 /// resolves to a private address still gets through, since we don't control
 /// resolution inside the HTTP client.
+///
+/// Applied to the URL in the token *and* to every redirect hop, because an
+/// origin that is allowed to redirect us could otherwise bounce the request
+/// onto a private address that this check never sees.
 pub fn validate_upstream(url: &Url) -> Result<(), PayloadError> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err(PayloadError::BadScheme);
     }
-    if let Some(url::Host::Ipv4(ip)) = url.host() {
-        if ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified() {
-            return Err(PayloadError::BlockedHost);
+    let blocked = match url.host() {
+        Some(url::Host::Ipv4(ip)) => is_blocked_v4(&ip),
+        Some(url::Host::Ipv6(ip)) => is_blocked_v6(&ip),
+        // Names are not resolved here, but "localhost" means this machine by
+        // definition rather than by resolution, so blocking the literals while
+        // allowing the name would be incoherent.
+        Some(url::Host::Domain(name)) => {
+            name.eq_ignore_ascii_case("localhost")
+                || name.to_ascii_lowercase().ends_with(".localhost")
         }
-    }
-    if let Some(url::Host::Ipv6(ip)) = url.host() {
-        if ip.is_loopback() || ip.is_unspecified() {
-            return Err(PayloadError::BlockedHost);
-        }
+        None => false,
+    };
+    if blocked {
+        return Err(PayloadError::BlockedHost);
     }
     Ok(())
+}
+
+fn is_blocked_v4(ip: &std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    ip.is_loopback()          // 127.0.0.0/8
+        || ip.is_private()    // 10/8, 172.16/12, 192.168/16
+        || ip.is_link_local() // 169.254/16, which is where cloud metadata lives
+        || ip.is_unspecified()
+        || o[0] == 0                            // 0.0.0.0/8, "this network"
+        || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10, carrier NAT
+        || o[0] >= 240 // 240.0.0.0/4 reserved, including 255.255.255.255
+}
+
+fn is_blocked_v6(ip: &std::net::Ipv6Addr) -> bool {
+    // ::ffff:a.b.c.d and ::a.b.c.d reach the IPv4 address they embed, so they
+    // have to be judged as that address rather than as opaque IPv6. This also
+    // covers ::1 and ::, which map to 0.0.0.1 and 0.0.0.0.
+    if let Some(v4) = ip.to_ipv4() {
+        return is_blocked_v4(&v4);
+    }
+    let s = ip.segments();
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || (s[0] & 0xfe00) == 0xfc00 // fc00::/7 unique local
+        || (s[0] & 0xffc0) == 0xfe80 // fe80::/10 link local
 }
 
 #[cfg(test)]
@@ -169,5 +206,49 @@ mod tests {
         assert!(bare("http://127.0.0.1/x.m3u8").parsed_url().is_err());
         assert!(bare("http://192.168.1.10/x.m3u8").parsed_url().is_err());
         assert!(bare("https://example.com/x.m3u8").parsed_url().is_ok());
+    }
+
+    /// An IPv6 literal can name an IPv4 address, so the v6 checks alone are not
+    /// enough: `[::ffff:127.0.0.1]` reaches loopback and `[::ffff:169.254.169.254]`
+    /// reaches cloud metadata.
+    #[test]
+    fn rejects_ipv4_mapped_ipv6_literals() {
+        assert!(bare("http://[::ffff:127.0.0.1]/x.m3u8")
+            .parsed_url()
+            .is_err());
+        assert!(bare("http://[::ffff:169.254.169.254]/meta")
+            .parsed_url()
+            .is_err());
+        assert!(bare("http://[::ffff:10.0.0.1]/x.m3u8")
+            .parsed_url()
+            .is_err());
+    }
+
+    #[test]
+    fn rejects_reserved_ipv6_ranges() {
+        assert!(bare("http://[::1]/x.m3u8").parsed_url().is_err());
+        assert!(bare("http://[fd00::1]/x.m3u8").parsed_url().is_err()); // unique local
+        assert!(bare("http://[fe80::1]/x.m3u8").parsed_url().is_err()); // link local
+        assert!(bare("https://[2606:4700::1111]/x.m3u8")
+            .parsed_url()
+            .is_ok());
+    }
+
+    #[test]
+    fn rejects_reserved_ipv4_ranges() {
+        assert!(bare("http://169.254.169.254/meta").parsed_url().is_err());
+        assert!(bare("http://100.64.0.1/x.m3u8").parsed_url().is_err()); // carrier NAT
+        assert!(bare("http://0.0.0.0/x.m3u8").parsed_url().is_err());
+        assert!(bare("http://255.255.255.255/x.m3u8").parsed_url().is_err());
+        // Decimal-encoded 127.0.0.1, which the URL parser normalises for us.
+        assert!(bare("http://2130706433/x.m3u8").parsed_url().is_err());
+    }
+
+    #[test]
+    fn rejects_localhost_by_name() {
+        assert!(bare("http://localhost:8080/x.m3u8").parsed_url().is_err());
+        assert!(bare("http://LocalHost/x.m3u8").parsed_url().is_err());
+        assert!(bare("http://api.localhost/x.m3u8").parsed_url().is_err());
+        assert!(bare("https://notlocalhost.com/x.m3u8").parsed_url().is_ok());
     }
 }

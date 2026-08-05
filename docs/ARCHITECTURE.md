@@ -104,11 +104,53 @@ binary content type.
 When neither is conclusive, the body is sniffed for `#EXTM3U` — but only for
 bodies under 4 MB, so a large segment is never buffered just to identify it.
 
+### The buffering limit is enforced while reading, not from `Content-Length`
+
+The 4 MB sniff threshold above is only consulted when the upstream declared a
+`Content-Length`, and that is both frequently absent — any chunked response — and
+attacker-controlled. On its own it therefore bounds nothing: a chunked body with
+no content type would be read into memory in full.
+
+So a second limit, `MAX_BUFFER_BYTES` (8 MB), is applied *as the body is read*.
+Past it, the prefix already in memory is rejoined to the rest of the stream and
+the response is forwarded without ever being fully resident. A body that claimed
+to be a playlist and then exceeded the limit returns `502` naming the limit,
+because forwarding a playlist unrewritten breaks playback with no visible cause.
+
+### Every redirect hop is validated, not just the first URL
+
+The SSRF guard runs on the URL in the token, but redirects are followed *inside*
+the HTTP client, where that check cannot reach. A custom redirect policy re-runs
+the same guard on each hop, so an origin cannot answer with a `302` to
+`http://127.0.0.1:6379/` and reach something the first check would have refused.
+Because a custom policy replaces the built-in one, it enforces its own hop limit.
+
 ### Relative URLs resolve against the post-redirect URL
 
 Redirects are followed before rewriting, and relative URLs resolve against
 wherever the request actually landed. Origins that redirect a playlist to a
 regional CDN would otherwise produce segment URLs pointing at the wrong host.
+
+### Proxied responses are isolated from this origin
+
+Responses carry whatever content type the upstream sent, and there is no
+authentication, so the proxy would otherwise serve attacker-chosen `text/html`
+from your own domain — script running on your origin. Every proxied response
+gets `Content-Security-Policy: sandbox`, which puts a document response in an
+opaque origin, and `X-Content-Type-Options: nosniff`. Neither affects playback:
+the `sandbox` directive applies to documents, not to segments fetched by a player.
+
+The headers are set inside `forward_response_headers` rather than at each call
+site, so no response path can be added later that quietly omits them.
+
+### Rewritten playlists do not keep the upstream validators
+
+A rewritten playlist is not the entity the origin described, so its `ETag` and
+`Last-Modified` are dropped rather than passed through — an `ETag` for the
+original bytes is a lie about the ones we send, and a caching layer in front of
+the proxy would act on it. Segments are forwarded byte-for-byte, so they keep
+theirs, and the client's `If-None-Match`/`If-Modified-Since` are forwarded
+upstream so that revalidation can still produce a `304`.
 
 ### `Content-Length` is only forwarded when it is still true
 
@@ -139,8 +181,8 @@ the main reason the build has a C toolchain requirement.
 
 - **No authentication.** The server is an open proxy to anyone who can reach it.
   See [DEPLOYMENT.md](DEPLOYMENT.md#hardening).
-- **The SSRF guard is best-effort.** It rejects loopback and private *IP
-  literals*, but a hostname resolving to a private address is not caught, since
+- **The SSRF guard is best-effort.** It rejects reserved *IP literals* on every
+  hop, but a hostname resolving to a private address is not caught, since
   resolution happens inside the HTTP client. Do not rely on it as a boundary.
 - **No caching.** Every request hits the origin. A CDN or caching reverse proxy
   in front handles this well, since segment URLs are stable and immutable.

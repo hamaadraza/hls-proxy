@@ -126,9 +126,12 @@ the request's `Host` header (honouring `X-Forwarded-Proto`).
 Fetches the resource named by the token and returns it, rewritten if it is a
 playlist. `HEAD` works too.
 
-**What the proxy sends upstream:** the headers from the token, plus your `Range`
-header if you sent one. Hop-by-hop headers (`Connection`, `Host`,
-`Transfer-Encoding`, …) are stripped. Redirects are followed, up to 10.
+**What the proxy sends upstream:** the headers from the token, plus your
+`Range`, `If-Range`, `If-None-Match` and `If-Modified-Since` headers if you sent
+them. Hop-by-hop headers (`Connection`, `Host`, `Transfer-Encoding`, …) are
+stripped. Redirects are followed, up to 10, and every hop is re-checked against
+the same host rules as the original URL — a redirect to a private address fails
+with `502`.
 
 **How the response is classified:**
 
@@ -144,12 +147,21 @@ header if you sent one. Hop-by-hop headers (`Connection`, `Host`,
 
 **Playlists** are buffered, rewritten, and returned as
 `application/vnd.apple.mpegurl` with `Cache-Control: no-cache, no-store,
-must-revalidate` — live playlists change constantly and must not be cached.
+must-revalidate` — live playlists change constantly and must not be cached. The
+upstream `ETag` and `Last-Modified` are *not* passed through, because the rewrite
+changes the body and those validators describe the origin's bytes rather than
+the ones you receive. A playlist larger than 8 MB is refused with `502`.
 
 **Segments** are streamed through without buffering. `Content-Type`,
 `Content-Range`, `Accept-Ranges`, `ETag`, `Last-Modified` and `Cache-Control`
-are passed through from the origin. `Content-Length` is passed through only when
-the body was not decompressed in transit, so it always matches the bytes sent.
+are passed through from the origin, and since your conditional headers are
+forwarded upstream, revalidation returns a `304` as normal. `Content-Length` is
+passed through only when the body was not decompressed in transit, so it always
+matches the bytes sent.
+
+**Every proxied response** also carries `Content-Security-Policy: sandbox` and
+`X-Content-Type-Options: nosniff`, so a response cannot execute as script on the
+proxy's own origin. This does not affect media playback.
 
 The upstream status code is preserved: a 404 upstream produces a 404 here.
 
@@ -223,12 +235,14 @@ Errors are JSON with an `error` field:
 | `400` | Token does not decode to valid JSON | `payload is not valid JSON: ...` |
 | `400` | `url` missing or unparseable | `missing required 'url' query parameter` |
 | `400` | Scheme is not `http`/`https` | `only http and https urls are supported` |
-| `400` | Host is a private or loopback IP literal | `upstream host is a private or loopback address` |
+| `400` | Host is a reserved address or `localhost` | `upstream host is a private, loopback or otherwise reserved address` |
 | `400` | Unknown browser profile | `unknown emulation profile 'nope'` |
 | `400` | Unknown platform | `unknown emulation os 'solaris' (expected windows, macos, linux, android, ios)` |
 | `400` | Malformed `header` parameter | `header 'Referer' must be in 'Name: Value' form` |
 | `502` | Upstream unreachable, TLS failure, timeout | `upstream request failed: ...` |
+| `502` | Upstream redirected to a blocked host | `upstream request failed: ... redirect blocked: ...` |
 | `502` | Upstream body could not be read | `failed to read upstream body: ...` |
+| `502` | Playlist too large to rewrite | `playlist is larger than the 8388608 byte rewrite limit` |
 | *upstream* | Origin returned an error | passed through unchanged (404, 403, …) |
 
 A `403` from the origin usually means the headers in your token are wrong or

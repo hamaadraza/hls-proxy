@@ -4,11 +4,12 @@ use crate::rewrite::{
     rewrite_playlist,
 };
 use crate::AppState;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -17,6 +18,42 @@ use url::Url;
 /// Above this size an unlabelled body is assumed to be media rather than a
 /// playlist, so we never buffer a whole segment just to sniff it.
 const MAX_SNIFF_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Hard ceiling on how much of a body we will hold in memory to rewrite it.
+///
+/// `MAX_SNIFF_BYTES` is only consulted when the upstream declared a
+/// `Content-Length`, and that is both frequently absent (any chunked response)
+/// and attacker-controlled. This limit is enforced while reading instead, so it
+/// holds no matter what the upstream claimed.
+const MAX_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
+/// A body read up to a limit, without committing to buffering all of it.
+enum Capped {
+    /// Fit inside the cap, so it is fully in memory and can be rewritten.
+    Complete(Bytes),
+    /// Passed the cap. The prefix already read is rejoined to the rest of the
+    /// stream, so the response can still be forwarded in full without ever
+    /// being held in memory at once.
+    Exceeded(Body),
+}
+
+async fn read_capped(upstream: wreq::Response, cap: usize) -> Result<Capped, wreq::Error> {
+    let mut stream = upstream.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+
+    while let Some(chunk) = stream.next().await {
+        buf.extend_from_slice(&chunk?);
+        if buf.len() > cap {
+            let prefix = Bytes::from(buf);
+            let rejoined =
+                futures_util::stream::once(async move { Ok::<Bytes, wreq::Error>(prefix) })
+                    .chain(stream);
+            return Ok(Capped::Exceeded(Body::from_stream(rejoined)));
+        }
+    }
+
+    Ok(Capped::Complete(Bytes::from(buf)))
+}
 
 pub struct AppError {
     status: StatusCode,
@@ -176,9 +213,19 @@ pub async fn proxy(
         request = request.header(name.as_str(), value.as_str());
     }
 
-    // Range must be forwarded or seeking in VOD streams breaks.
-    if let Some(range) = req_headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
-        request = request.header("Range", range);
+    // Range must be forwarded or seeking in VOD streams breaks. The validators
+    // go with it: we hand clients the upstream `ETag`/`Last-Modified` on segment
+    // responses, so dropping the matching conditional headers on the way back up
+    // would mean revalidation could never produce a 304.
+    for name in [
+        header::RANGE,
+        header::IF_NONE_MATCH,
+        header::IF_MODIFIED_SINCE,
+        header::IF_RANGE,
+    ] {
+        if let Some(value) = req_headers.get(&name).and_then(|v| v.to_str().ok()) {
+            request = request.header(name.as_str(), value);
+        }
     }
 
     let upstream = request.send().await.map_err(|e| {
@@ -206,7 +253,20 @@ pub async fn proxy(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
 
+    // Now that conditional headers are forwarded, upstream can answer 304. It
+    // carries no body, so there is nothing to classify, sniff or rewrite — and
+    // sending one anyway would violate the spec.
+    if status == StatusCode::NOT_MODIFIED {
+        let mut response = Response::builder().status(status);
+        let headers = response.headers_mut().unwrap();
+        forward_response_headers(&upstream_headers, headers, false);
+        return Ok(response
+            .body(Body::empty())
+            .expect("response is well formed"));
+    }
+
     let kind = classify(content_type.as_deref(), &final_url, content_length);
+    let declared_playlist = matches!(kind, Kind::Playlist);
     let proxy_base = state.resolve_base(&req_headers);
 
     match kind {
@@ -219,21 +279,45 @@ pub async fn proxy(
                 .expect("response is well formed"))
         }
         Kind::Playlist | Kind::Sniff => {
-            let bytes = upstream.bytes().await.map_err(|e| {
+            let capped = read_capped(upstream, MAX_BUFFER_BYTES).await.map_err(|e| {
                 AppError::new(
                     StatusCode::BAD_GATEWAY,
                     format!("failed to read upstream body: {e}"),
                 )
             })?;
 
-            let is_playlist = matches!(kind, Kind::Playlist) || body_looks_like_playlist(&bytes);
+            let bytes = match capped {
+                Capped::Complete(bytes) => bytes,
+                Capped::Exceeded(body) => {
+                    // A playlist this large cannot be rewritten, and forwarding
+                    // it unrewritten would fail playback with no visible cause,
+                    // so say so plainly instead.
+                    if declared_playlist {
+                        tracing::warn!(url = %final_url, "playlist exceeds the rewrite limit");
+                        return Err(AppError::new(
+                            StatusCode::BAD_GATEWAY,
+                            format!(
+                                "playlist is larger than the {MAX_BUFFER_BYTES} byte rewrite limit"
+                            ),
+                        ));
+                    }
+                    // Unlabelled and far too large to be a playlist, so it was
+                    // media after all. Stream it through.
+                    let mut response = Response::builder().status(status);
+                    let headers = response.headers_mut().unwrap();
+                    forward_response_headers(&upstream_headers, headers, false);
+                    return Ok(response.body(body).expect("response is well formed"));
+                }
+            };
+
+            let is_playlist = declared_playlist || body_looks_like_playlist(&bytes);
 
             if !is_playlist {
                 let mut response = Response::builder().status(status);
                 let headers = response.headers_mut().unwrap();
                 forward_response_headers(&upstream_headers, headers, false);
                 return Ok(response
-                    .body(Body::from(bytes.to_vec()))
+                    .body(Body::from(bytes))
                     .expect("response is well formed"));
             }
 
@@ -331,6 +415,26 @@ fn copy_headers(headers: &wreq::header::HeaderMap) -> HeaderMap {
     out
 }
 
+/// Responses carry whatever the upstream said they were, and this server has no
+/// authentication, so anyone could otherwise use it to serve `text/html` from
+/// your own origin — a stored-XSS primitive against the proxy's domain and
+/// anything sharing it.
+///
+/// `sandbox` drops a document response into an opaque origin, so script in it
+/// can no longer reach this origin, and `nosniff` stops a mislabelled body from
+/// being sniffed into one. Neither affects media: the CSP `sandbox` directive
+/// applies to documents, not to segments fetched by a player.
+fn set_isolation_headers(to: &mut HeaderMap) {
+    to.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("sandbox"),
+    );
+    to.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+}
+
 fn forward_response_headers(from: &HeaderMap, to: &mut HeaderMap, is_playlist: bool) {
     const PASS_THROUGH: [HeaderName; 6] = [
         header::CONTENT_TYPE,
@@ -342,7 +446,16 @@ fn forward_response_headers(from: &HeaderMap, to: &mut HeaderMap, is_playlist: b
     ];
 
     for name in PASS_THROUGH {
-        if is_playlist && (name == header::CONTENT_TYPE || name == header::CACHE_CONTROL) {
+        // A rewritten playlist is not the entity upstream described, so its
+        // content type and caching directives are replaced by the caller — and
+        // its validators have to be dropped outright rather than replaced,
+        // since an `ETag` for the original bytes would be a lie about ours.
+        if is_playlist
+            && (name == header::CONTENT_TYPE
+                || name == header::CACHE_CONTROL
+                || name == header::ETAG
+                || name == header::LAST_MODIFIED)
+        {
             continue;
         }
         if let Some(value) = from.get(&name) {
@@ -357,6 +470,10 @@ fn forward_response_headers(from: &HeaderMap, to: &mut HeaderMap, is_playlist: b
             to.insert(header::CONTENT_LENGTH, value.clone());
         }
     }
+
+    // Applied here rather than at each call site so no proxied response can be
+    // built without it.
+    set_isolation_headers(to);
 }
 
 fn is_hop_by_hop(name: &str) -> bool {
@@ -429,6 +546,76 @@ mod tests {
             classify(None, &url("https://a.test/opaque"), Some(1_024)),
             Kind::Sniff
         ));
+    }
+
+    fn upstream_headers() -> HeaderMap {
+        let mut from = HeaderMap::new();
+        from.insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp2t"));
+        from.insert(header::ETAG, HeaderValue::from_static("\"abc123\""));
+        from.insert(
+            header::LAST_MODIFIED,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        from.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("max-age=3600"),
+        );
+        from.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+        from
+    }
+
+    /// The rewrite changes the body, so upstream validators no longer describe
+    /// what we serve. Keeping them would hand a caching layer in front of the
+    /// proxy an `ETag` for bytes it never sees.
+    #[test]
+    fn playlist_rewrite_drops_stale_validators() {
+        let mut to = HeaderMap::new();
+        forward_response_headers(&upstream_headers(), &mut to, true);
+
+        assert!(to.get(header::ETAG).is_none());
+        assert!(to.get(header::LAST_MODIFIED).is_none());
+        assert!(to.get(header::CONTENT_TYPE).is_none()); // caller sets it
+        assert!(to.get(header::CACHE_CONTROL).is_none()); // caller sets it
+        assert_eq!(to.get(header::ACCEPT_RANGES).unwrap(), "bytes");
+    }
+
+    /// Segments are forwarded byte-for-byte, so their validators are still true
+    /// and are what makes revalidation possible.
+    #[test]
+    fn binary_responses_keep_validators() {
+        let mut to = HeaderMap::new();
+        forward_response_headers(&upstream_headers(), &mut to, false);
+
+        assert_eq!(to.get(header::ETAG).unwrap(), "\"abc123\"");
+        assert_eq!(
+            to.get(header::LAST_MODIFIED).unwrap(),
+            "Wed, 21 Oct 2015 07:28:00 GMT"
+        );
+        assert_eq!(to.get(header::CONTENT_TYPE).unwrap(), "video/mp2t");
+        assert_eq!(to.get(header::CACHE_CONTROL).unwrap(), "max-age=3600");
+    }
+
+    #[test]
+    fn every_proxied_response_is_isolated() {
+        for is_playlist in [true, false] {
+            let mut to = HeaderMap::new();
+            forward_response_headers(&upstream_headers(), &mut to, is_playlist);
+            assert_eq!(to.get(header::CONTENT_SECURITY_POLICY).unwrap(), "sandbox");
+            assert_eq!(to.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+        }
+    }
+
+    /// An upstream that mislabels itself as HTML must not become script running
+    /// on this proxy's origin.
+    #[test]
+    fn html_from_upstream_is_sandboxed() {
+        let mut from = HeaderMap::new();
+        from.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html"));
+        let mut to = HeaderMap::new();
+        forward_response_headers(&from, &mut to, false);
+
+        assert_eq!(to.get(header::CONTENT_TYPE).unwrap(), "text/html");
+        assert_eq!(to.get(header::CONTENT_SECURITY_POLICY).unwrap(), "sandbox");
     }
 
     #[test]
