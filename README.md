@@ -4,55 +4,12 @@
 [![Release](https://github.com/hamaadraza/hls-proxy/actions/workflows/release.yml/badge.svg)](https://github.com/hamaadraza/hls-proxy/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-An HLS reverse proxy in Rust. You hand it a stream URL plus whatever headers
-that stream demands; it hands back a playlist whose every URL points at your own
-domain — and it keeps those headers attached to every variant playlist, segment,
-encryption key and init segment that follows.
+**Play any HLS stream from your own domain — headers, CORS and all.**
 
-Upstream requests go out through [`wreq`](https://github.com/0x676e67/wreq) with
-Chrome emulation, so the TLS (JA3/JA4) and HTTP/2 fingerprints match a real
-browser instead of a Rust HTTP client.
-
-## Why
-
-Two things break browser playback of protected HLS streams:
-
-1. **Headers.** The origin wants a `Referer`/`Origin`/`User-Agent`, on *every*
-   request. A browser player won't send custom headers for segments, and CORS
-   blocks the request anyway.
-2. **Fingerprints.** Even with perfect headers, origins increasingly reject
-   clients whose TLS handshake doesn't look like a browser.
-
-This proxy handles both, and does it statelessly: everything needed to fetch a
-resource is encoded in its URL, so there is no session store, nothing to expire,
-and you can run as many instances behind a load balancer as you like.
-
-## Install
-
-Grab a prebuilt binary from the [releases page](../../releases) — it is a single
-self-contained executable with no runtime dependencies:
-
-| Platform | Architecture | Archive |
-|---|---|---|
-| Linux | x86_64 | `hls-proxy-<tag>-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux | arm64 | `hls-proxy-<tag>-aarch64-unknown-linux-gnu.tar.gz` |
-| macOS | Intel | `hls-proxy-<tag>-x86_64-apple-darwin.tar.gz` |
-| macOS | Apple silicon | `hls-proxy-<tag>-aarch64-apple-darwin.tar.gz` |
-| Windows | x86_64 | `hls-proxy-<tag>-x86_64-pc-windows-msvc.zip` |
-| Windows | arm64 | `hls-proxy-<tag>-aarch64-pc-windows-msvc.zip` |
-
-Each archive ships with a `.sha256` checksum file. Linux binaries are built on
-Ubuntu 22.04 (glibc 2.35) for broad compatibility.
-
-Or build from source:
-
-## Quick start
-
-```bash
-cargo run
-```
-
-Then build a playable URL:
+Give it a stream URL plus the headers that stream requires, and it hands back an
+`.m3u8` that plays anywhere. Every playlist, segment and key is served from your
+domain, and the original request headers are reattached automatically all the
+way down to the last segment.
 
 ```bash
 curl "http://localhost:8080/encode?url=https://example.com/master.m3u8&header=Referer:https://example.com/"
@@ -65,177 +22,203 @@ curl "http://localhost:8080/encode?url=https://example.com/master.m3u8&header=Re
 }
 ```
 
-Feed that `url` to hls.js, VLC, ffmpeg, or a `<video>` tag.
+Drop that `url` into hls.js, VLC, ffmpeg or a `<video>` tag and it just plays.
 
-## How it works
+## The problem it solves
 
-Every proxied URL is `/proxy/{token}`, where the token is base64url-encoded JSON:
+A protected HLS stream usually refuses to play in a browser for three reasons:
 
-```json
-{
-  "url": "https://origin.example.com/live/master.m3u8",
-  "headers": { "Referer": "https://origin.example.com/" },
-  "emulation": "chrome_137",
-  "os": "windows"
-}
+1. **It demands headers on every request.** `Referer`, `Origin`, a specific
+   `User-Agent` — and not just for the playlist, but for all several thousand
+   segments. Browser video players give you no way to attach custom headers to
+   segment requests.
+2. **CORS blocks it.** The origin never sent `Access-Control-Allow-Origin`, so
+   the browser refuses the response even when the request succeeds.
+3. **The origin only trusts browsers.** Some reject any client that doesn't
+   *look* like one, right down to the TLS handshake.
+
+hls-proxy sits in the middle and handles all three. Your player only ever talks
+to your domain, over plain CORS-enabled HTTP, and the proxy does the awkward
+part upstream.
+
+## Features
+
+- **Headers propagate automatically.** Set them once; every variant playlist,
+  segment, AES key and init segment inherits them.
+- **Stateless.** Everything needed to fetch a resource is encoded in its URL, so
+  there is no session store, nothing to expire, and you can run any number of
+  instances behind a load balancer.
+- **Segments stream through.** Video bytes are never buffered in memory, and
+  `Range` requests are forwarded so seeking works.
+- **Live and VOD.** Live playlists are re-fetched and rewritten on every refresh.
+- **Handles real-world playlists.** Master and media playlists, `EXT-X-KEY`,
+  `EXT-X-MAP`, `EXT-X-MEDIA`, I-frame streams, low-latency `EXT-X-PART`,
+  relative and absolute URLs, inline `data:` keys.
+- **Browser-identical requests.** Upstream fetches use a real browser's TLS and
+  HTTP/2 fingerprint, so origins that fingerprint clients still serve them.
+- **One binary.** No runtime dependencies, no config file required.
+
+## Install
+
+Download a binary from the
+[releases page](https://github.com/hamaadraza/hls-proxy/releases):
+
+| Platform | Architecture | Archive |
+|---|---|---|
+| Linux | x86_64 | `hls-proxy-<tag>-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux | arm64 | `hls-proxy-<tag>-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS | Apple silicon | `hls-proxy-<tag>-aarch64-apple-darwin.tar.gz` |
+| macOS | Intel | `hls-proxy-<tag>-x86_64-apple-darwin.tar.gz` |
+| Windows | x86_64 | `hls-proxy-<tag>-x86_64-pc-windows-msvc.zip` |
+| Windows | arm64 | `hls-proxy-<tag>-aarch64-pc-windows-msvc.zip` |
+
+Every archive ships a `.sha256` checksum. Linux builds target glibc 2.35
+(Ubuntu 22.04) for broad compatibility.
+
+Or build it yourself — see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md):
+
+```bash
+cargo build --release
 ```
 
-Only `url` is required. When the proxy fetches a playlist it rewrites every URL
-inside it into a *new* token carrying the same headers, emulation and os — which
-is what makes the context propagate all the way down to the last segment.
+## Usage
 
-Playlists are buffered and rewritten. Everything else (segments, keys, init
-segments) is streamed straight through without buffering, with `Range` requests
-forwarded so seeking works. Responses carry permissive CORS headers.
+Start the server:
 
-Rewriting covers bare URI lines and the `URI="..."` attribute of any `#EXT-`
-tag, so `EXT-X-KEY`, `EXT-X-MAP`, `EXT-X-MEDIA`, `EXT-X-I-FRAME-STREAM-INF`,
-`EXT-X-PART` and friends all work. Inline `data:` URIs are left alone.
+```bash
+hls-proxy
+```
 
-## Routes
+It listens on `0.0.0.0:8080` and needs no configuration to work locally.
 
-| Route | Purpose |
-|---|---|
-| `GET /proxy/{token}` | The proxy. Playlists rewritten, everything else streamed. |
-| `GET /encode?url=…&header=Name:Value` | Builds a token and full URL. Repeat `header` as needed; optional `emulation` and `os`. |
-| `POST /encode` | Same, with a JSON body — easier for long header sets. |
-| `GET /` | Usage / health. |
+### Build a stream URL
+
+The `/encode` endpoint turns a stream and its headers into a playable URL:
+
+```bash
+curl "http://localhost:8080/encode?url=https://example.com/master.m3u8&header=Referer:https://example.com/&header=Origin:https://example.com"
+```
+
+Repeat `header` as many times as you need. For longer header sets, POST JSON
+instead:
 
 ```bash
 curl -X POST http://localhost:8080/encode \
   -H 'Content-Type: application/json' \
-  -d '{"url":"https://example.com/master.m3u8","headers":{"Referer":"https://example.com/"}}'
+  -d '{
+    "url": "https://example.com/master.m3u8",
+    "headers": {
+      "Referer": "https://example.com/",
+      "User-Agent": "Mozilla/5.0 ..."
+    }
+  }'
 ```
+
+### Play it
+
+```html
+<video id="video" controls></video>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+<script>
+  const hls = new Hls();
+  hls.loadSource("http://localhost:8080/proxy/eyJ1cmwiOi...");
+  hls.attachMedia(document.getElementById("video"));
+</script>
+```
+
+Or from the command line:
+
+```bash
+ffplay "http://localhost:8080/proxy/eyJ1cmwiOi..."
+ffmpeg -i "http://localhost:8080/proxy/eyJ1cmwiOi..." -c copy out.mp4
+```
+
+Full endpoint and payload reference: **[docs/API.md](docs/API.md)**.
 
 ## Configuration
 
-Read from the environment (a local `.env` is loaded if present — see
-`.env.example`):
+All configuration is environment variables. A local `.env` file is loaded if
+present — see [.env.example](.env.example).
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `BASE_URL` | *(request `Host`)* | Public origin that rewritten URLs point at, e.g. `https://hls-proxy.example.com`. Falling back to the request host means local runs need no config. |
-| `BIND` | `0.0.0.0` | Bind address. |
-| `PORT` | `8080` | Port. |
-| `DEFAULT_EMULATION` | `chrome_137` | Any [wreq-util](https://github.com/0x676e67/wreq-util) profile. |
-| `DEFAULT_EMULATION_OS` | `windows` | `windows`, `macos`, `linux`, `android`, `ios`. |
+| `BASE_URL` | *(request `Host`)* | Public origin the rewritten URLs point at, e.g. `https://hls-proxy.example.com`. Falling back to the request host means local runs need no config. |
+| `BIND` | `0.0.0.0` | Address to bind. |
+| `PORT` | `8080` | Port to listen on. |
+| `DEFAULT_EMULATION` | `chrome_137` | Browser profile used for upstream requests. |
+| `DEFAULT_EMULATION_OS` | `windows` | Platform that profile presents as. |
 | `RUST_LOG` | `hls_proxy=info` | Log filter. |
 
-Behind a reverse proxy, either set `BASE_URL` or forward `X-Forwarded-Proto` so
-generated URLs use `https`.
-
-## Fingerprint check
-
-Point the proxy at `tls.peet.ws` and compare:
+Set `BASE_URL` when you deploy behind a domain:
 
 ```bash
-curl "http://localhost:8080/encode?url=https://tls.peet.ws/api/all"
-# then fetch the returned url
+BASE_URL=https://hls-proxy.example.com PORT=8080 hls-proxy
 ```
 
-Verified output for the default profile:
+Deployment guides for systemd, Docker, nginx and Caddy:
+**[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**.
 
-| | through the proxy | plain curl |
-|---|---|---|
-| JA4 | `t13d1516h2_8daaf6152771_d8a2da3f94cd` | `t13d2012_2b729b4bf6f3_e24568c0d440` |
-| Akamai HTTP/2 | `52d84b11737d980aef856699f885ca86` | *(no HTTP/2)* |
-| User-Agent | `Mozilla/5.0 (Windows NT 10.0; Win64; x64) …Chrome…` | `curl/8.12.1` |
+## How it works
 
-## Notes and limits
+Every proxied URL has the form `/proxy/{token}`, where the token is
+base64url-encoded JSON describing what to fetch:
 
-- **No authentication.** Anyone who can reach the server can encode a payload
-  and use your bandwidth. Put it behind a firewall, or add a shared secret
-  before exposing it publicly.
-- **SSRF guard is best-effort.** Loopback and private *IP literals* are
-  rejected, but a hostname that resolves to a private address is not, since
-  resolution happens inside the HTTP client.
-- **Emulation is per-client, not per-request**, so each distinct
-  `emulation`/`os` pair lazily builds and caches its own pooled client.
-
-## Building from source
-
-`wreq` compiles BoringSSL, so you need **cmake**, a **C/C++ toolchain**, and
-**libclang** (for bindgen).
-
-- **Linux:** `sudo apt-get install cmake clang libclang-dev`
-- **macOS:** `brew install cmake` (Xcode command line tools supply clang)
-- **Windows:** cmake, the MSVC C++ workload, and LLVM. If the build reports
-  "Unable to find libclang", set `LIBCLANG_PATH` to a directory containing
-  `libclang.dll`.
-
-### The BoringSSL assembly backend
-
-Assembly is used whenever it can be. On Linux and macOS that is always, and
-`cmake/boringssl-asm-fallback.cmake` does nothing at all.
-
-Windows is the exception: BoringSSL assembles its x86/x86_64 crypto with **NASM**,
-and `boring-sys2` only disables assembly automatically when cross-compiling — so
-a native Windows build fails outright without NASM. The shim detects this:
-
-- **NASM on `PATH`** → nothing is changed, and BoringSSL builds with assembly.
-- **NASM missing** → falls back to the portable C backend so the build succeeds.
-
-To get the faster build on Windows, install NASM in an elevated shell and
-rebuild — no config change needed, the shim picks it up automatically:
-
-```bash
-choco install nasm
+```json
+{
+  "url": "https://example.com/live/master.m3u8",
+  "headers": { "Referer": "https://example.com/" }
+}
 ```
 
-Then reopen your terminal and force a reconfigure (a stale `CMakeCache.txt`
-would otherwise keep the previous decision):
+When the proxy fetches a playlist, it rewrites every URL inside it into a *new*
+token carrying the same headers. That is the whole trick — context propagates
+downward automatically, so a segment request arriving an hour later still knows
+exactly which headers it needs.
 
-```bash
-cargo clean -p boring-sys2
+```
+player                    hls-proxy                     origin
+  │                           │                            │
+  ├── /proxy/{master} ───────►│── GET master.m3u8 ────────►│
+  │                           │   + Referer, Origin        │
+  │◄── rewritten playlist ────┤◄── #EXTM3U ────────────────┤
+  │    (URLs now point here)  │                            │
+  │                           │                            │
+  ├── /proxy/{segment} ──────►│── GET segment.ts ─────────►│
+  │                           │   + the same headers       │
+  │◄── streamed bytes ────────┤◄── video data ─────────────┤
 ```
 
-The fallback costs raw AES/SHA throughput. It does **not** change the TLS
-JA3/JA4 fingerprint, which comes from cipher suites, extensions and HTTP/2
-settings rather than from how the crypto is compiled.
+Playlists are small, so they are buffered and rewritten. Everything else is
+streamed straight through without buffering.
 
-### Cross-compiling
+Architecture and design decisions: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 
-`.cargo/config.toml` sets `CMAKE_TOOLCHAIN_FILE`, and `boring-sys2` skips its own
-cross-compile cmake setup when that variable is set. If you build for a target
-other than your host, remove the `[env]` section. The release workflow sidesteps
-this by building every target on a native runner.
+## Security
 
-## CI and releases
+**There is no authentication.** Anyone who can reach the server can encode a
+payload and use your bandwidth as an open proxy. Keep it on a private network,
+put an authenticating reverse proxy in front of it, or restrict access at the
+firewall before exposing it publicly.
 
-`.github/workflows/ci.yml` runs on every push and pull request: `rustfmt`,
-`clippy -D warnings`, the test suite on Linux/Windows/macOS, and a smoke test
-that boots the binary and calls `/encode`. Windows CI installs NASM, so the
-assembly path is exercised there too.
+The SSRF guard rejects loopback and private *IP literals*, but a hostname that
+resolves to a private address will still be fetched, because resolution happens
+inside the HTTP client. Do not treat this as a hard boundary.
 
-`.github/workflows/release.yml` builds all six targets on native runners and
-publishes them. To cut a release:
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#hardening) for ways to lock it down.
 
-```bash
-git tag v0.1.0 && git push origin v0.1.0
-```
+## Documentation
 
-Artifacts are uploaded to a GitHub Release with generated notes and checksums.
-Running the workflow manually builds the archives without publishing, unless it
-is run from a tag — handy for rehearsing a release.
-
-The `aarch64-pc-windows-msvc` target is marked experimental and cannot block a
-release: BoringSSL's Windows assembly path is x86-only, so that target builds
-the portable C backend.
-
-## Tests
-
-```bash
-cargo test
-```
-
-Covers payload round-tripping, the SSRF guard, playlist rewriting (relative and
-absolute URLs, `EXT-X-KEY`/`EXT-X-MAP`, multiple URIs per line, `data:` URIs,
-comment preservation), content classification, and base-URL resolution.
+| Document | Contents |
+|---|---|
+| [docs/API.md](docs/API.md) | Endpoints, payload schema, status codes, errors |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | systemd, Docker, nginx/Caddy, TLS, hardening |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How requests flow, design decisions, limits |
+| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Building, toolchain setup, tests, releasing |
 
 ## Contributing
 
 Pull requests are welcome. CI enforces `cargo fmt` and `cargo clippy -D
-warnings`, so run both before pushing:
+warnings`, so run this before pushing:
 
 ```bash
 cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test

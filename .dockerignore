@@ -1,0 +1,7 @@
+target
+dist
+.git
+.github
+docs
+.env
+README.md

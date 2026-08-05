@@ -92,6 +92,7 @@ jobs:
           strip "target/${{ matrix.target }}/release/hls-proxy" || true
           cp "target/${{ matrix.target }}/release/hls-proxy" "dist/${STAGE}/"
           cp README.md .env.example "dist/${STAGE}/"
+          cp -r docs "dist/${STAGE}/"
           if [ -f LICENSE ]; then cp LICENSE "dist/${STAGE}/"; fi
 
           cd dist
@@ -119,6 +120,7 @@ jobs:
 
           Copy-Item "target/${{ matrix.target }}/release/hls-proxy.exe" "dist/$Stage/"
           Copy-Item "README.md", ".env.example" "dist/$Stage/"
+          Copy-Item "docs" "dist/$Stage/" -Recurse
           if (Test-Path "LICENSE") { Copy-Item "LICENSE" "dist/$Stage/" }
 
           Compress-Archive -Path "dist/$Stage" -DestinationPath "dist/$Stage.zip"

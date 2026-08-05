@@ -172,9 +172,8 @@ mod tests {
         let out = rewrite_playlist(input, &base(), &payload(), PROXY);
 
         let key_line = out.lines().nth(1).unwrap();
-        assert!(
-            key_line.starts_with("#EXT-X-KEY:METHOD=AES-128,URI=\"https://hls-proxy.example.com/proxy/")
-        );
+        assert!(key_line
+            .starts_with("#EXT-X-KEY:METHOD=AES-128,URI=\"https://hls-proxy.example.com/proxy/"));
         assert!(key_line.ends_with("\",IV=0x0"));
 
         let key_uri = key_line
@@ -206,7 +205,10 @@ mod tests {
     fn rewrites_multiple_uris_on_one_line() {
         let input = "#EXT-X-MEDIA:TYPE=AUDIO,URI=\"a/audio.m3u8\",GROUP-ID=\"aud\"\n";
         let out = rewrite_playlist(input, &base(), &payload(), PROXY);
-        assert_eq!(out.matches("https://hls-proxy.example.com/proxy/").count(), 1);
+        assert_eq!(
+            out.matches("https://hls-proxy.example.com/proxy/").count(),
+            1
+        );
         assert!(out.contains("GROUP-ID=\"aud\""));
     }
 
