@@ -152,6 +152,7 @@ present — see [.env.example](.env.example).
 | `PORT` | `8080` | Port to listen on. |
 | `DEFAULT_EMULATION` | `chrome_137` | Browser profile used for upstream requests. |
 | `DEFAULT_EMULATION_OS` | `windows` | Platform that profile presents as. |
+| `PROXY_URL` | *(none)* | Route all upstream requests through this HTTP/HTTPS proxy, e.g. `http://user:pass@host:port`. Unset means direct connections. |
 | `RUST_LOG` | `hls_proxy=info` | Log filter. |
 
 Set `BASE_URL` when you deploy behind a domain:
@@ -159,6 +160,23 @@ Set `BASE_URL` when you deploy behind a domain:
 ```bash
 BASE_URL=https://hls-proxy.example.com PORT=8080 hls-proxy
 ```
+
+### Routing upstream traffic through a proxy
+
+When one provider serves many of your streams, all those requests leaving from a
+single IP is what earns you `429 Too Many Requests`. Set `PROXY_URL` and every
+upstream fetch — playlists and segments, across all emulation profiles — goes
+out through the proxy instead:
+
+```bash
+PROXY_URL="http://user:pass@proxy.example.com:8080" hls-proxy
+```
+
+Credentials in the URL are sent to the proxy as `Proxy-Authorization`; only the
+redacted `scheme://host:port` is ever logged. A malformed `PROXY_URL` fails at
+startup rather than quietly falling back to direct connections. Only `http` and
+`https` proxies are supported. To spread load across several IPs, run one
+instance per proxy, or put a rotating proxy behind a single `PROXY_URL`.
 
 Deployment guides for systemd, Docker, nginx and Caddy:
 **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**.

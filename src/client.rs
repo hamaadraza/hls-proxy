@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::Duration;
 use wreq::redirect::Policy;
-use wreq::Client;
+use wreq::{Client, Proxy};
 use wreq_util::{Emulation, EmulationOS, EmulationOption};
 
 const MAX_REDIRECTS: usize = 10;
@@ -26,16 +26,21 @@ impl Profile {
 /// cached; a `Client` is cheap to clone and pools its connections.
 pub struct ClientPool {
     default_profile: Profile,
+    /// When set, every client routes its upstream requests through this proxy.
+    /// Shared by all profiles so a single provider sees traffic leave from the
+    /// proxy's address instead of ours, which is what keeps rate limits at bay.
+    proxy: Option<Proxy>,
     clients: RwLock<HashMap<String, Client>>,
 }
 
 impl ClientPool {
-    pub fn new(browser: &str, os: &str) -> Result<Self, String> {
+    pub fn new(browser: &str, os: &str, proxy: Option<Proxy>) -> Result<Self, String> {
         let pool = Self {
             default_profile: Profile {
                 browser: browser.to_string(),
                 os: os.to_string(),
             },
+            proxy,
             clients: RwLock::new(HashMap::new()),
         };
         // Fail at startup rather than on the first request.
@@ -58,7 +63,7 @@ impl ClientPool {
             return Ok(client.clone());
         }
 
-        let client = build_client(&profile)?;
+        let client = build_client(&profile, self.proxy.clone())?;
         self.clients
             .write()
             .unwrap()
@@ -79,6 +84,45 @@ pub fn parse_emulation_os(name: &str) -> Result<EmulationOS, String> {
     serde_json::from_value::<EmulationOS>(serde_json::Value::String(name.to_string())).map_err(
         |_| format!("unknown emulation os '{name}' (expected windows, macos, linux, android, ios)"),
     )
+}
+
+/// Parse `PROXY_URL` into a proxy applied to every upstream request. The URL
+/// carries its own credentials (`http://user:pass@host:port`), which wreq
+/// percent-decodes into a `Proxy-Authorization` header for us.
+///
+/// SOCKS is not compiled in, so only `http`/`https` proxies are accepted; a
+/// clearer error here beats a confusing connat failure later.
+pub fn parse_proxy(raw: &str) -> Result<Proxy, String> {
+    let url = url::Url::parse(raw).map_err(|_| "PROXY_URL is not a valid url".to_string())?;
+    match url.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(format!(
+                "PROXY_URL scheme '{other}' is not supported (use http or https)"
+            ))
+        }
+    }
+    if url.host_str().is_none() {
+        return Err("PROXY_URL is missing a host".to_string());
+    }
+    // Route every scheme (http and https upstreams alike) through the one proxy.
+    Proxy::all(raw).map_err(|e| format!("invalid PROXY_URL: {e}"))
+}
+
+/// A proxy URL with any credentials stripped, safe to put in logs. Falls back to
+/// a fixed placeholder rather than ever risking leaking the raw string.
+pub fn redact_proxy(raw: &str) -> String {
+    match url::Url::parse(raw) {
+        Ok(url) => {
+            let scheme = url.scheme();
+            let host = url.host_str().unwrap_or("?");
+            match url.port() {
+                Some(port) => format!("{scheme}://{host}:{port}"),
+                None => format!("{scheme}://{host}"),
+            }
+        }
+        Err(_) => "<unparseable>".to_string(),
+    }
 }
 
 /// The SSRF guard runs on the URL in the token, but redirects are followed
@@ -102,17 +146,23 @@ fn guarded_redirect_policy() -> Policy {
     })
 }
 
-fn build_client(profile: &Profile) -> Result<Client, String> {
+fn build_client(profile: &Profile, proxy: Option<Proxy>) -> Result<Client, String> {
     let emulation = EmulationOption::builder()
         .emulation(parse_emulation(&profile.browser)?)
         .emulation_os(parse_emulation_os(&profile.os)?)
         .build();
 
-    Client::builder()
+    let mut builder = Client::builder()
         .emulation(emulation)
         .redirect(guarded_redirect_policy())
         .connect_timeout(Duration::from_secs(15))
-        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_idle_timeout(Duration::from_secs(90));
+
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy);
+    }
+
+    builder
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))
 }
@@ -135,6 +185,32 @@ mod tests {
         assert!(parse_emulation_os("solaris").is_err());
     }
 
+    #[test]
+    fn parses_proxy_with_credentials() {
+        assert!(parse_proxy("http://user:pass@proxy.example.com:8080").is_ok());
+        assert!(parse_proxy("https://proxy.example.com:8080").is_ok());
+    }
+
+    #[test]
+    fn rejects_unusable_proxy_urls() {
+        assert!(parse_proxy("socks5://user:pass@host:1080").is_err()); // socks not compiled in
+        assert!(parse_proxy("ftp://host:21").is_err());
+        assert!(parse_proxy("not a url").is_err());
+    }
+
+    /// Credentials must never reach the logs.
+    #[test]
+    fn redaction_strips_credentials() {
+        assert_eq!(
+            redact_proxy("http://user:secret@proxy.example.com:8080"),
+            "http://proxy.example.com:8080"
+        );
+        assert_eq!(
+            redact_proxy("https://proxy.example.com"),
+            "https://proxy.example.com"
+        );
+    }
+
     /// The initial URL is validated by the proxy layer, but redirects are
     /// followed inside the client where that check cannot reach. Serve a real
     /// redirect pointing at loopback and confirm the client refuses to follow it.
@@ -153,10 +229,13 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let client = build_client(&Profile {
-            browser: "chrome_137".to_string(),
-            os: "windows".to_string(),
-        })
+        let client = build_client(
+            &Profile {
+                browser: "chrome_137".to_string(),
+                os: "windows".to_string(),
+            },
+            None,
+        )
         .unwrap();
 
         let err = client
@@ -178,7 +257,7 @@ mod tests {
 
     #[test]
     fn pool_caches_per_browser_and_os() {
-        let pool = ClientPool::new("chrome_137", "windows").unwrap();
+        let pool = ClientPool::new("chrome_137", "windows", None).unwrap();
         pool.get(None, None).unwrap();
         pool.get(Some("chrome_137"), Some("windows")).unwrap();
         assert_eq!(pool.clients.read().unwrap().len(), 1);
