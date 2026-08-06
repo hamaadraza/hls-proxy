@@ -70,6 +70,7 @@ The consequences are worth stating plainly:
 | [`src/rewrite.rs`](../src/rewrite.rs) | Playlist rewriting and content classification. Pure functions, heavily unit-tested. |
 | [`src/client.rs`](../src/client.rs) | Pool of HTTP clients, one per browser + platform profile, each in a direct and (if configured) a proxied variant. Proxy parsing and redaction. |
 | [`src/router.rs`](../src/router.rs) | `fallback` mode's per-host rate-limit breaker: decides direct vs proxied and reacts to 429s. Pure state machine, deterministically tested. |
+| [`src/probe.rs`](../src/probe.rs) | `auto` segment mode's per-host cache: decides whether a host's segments can be served direct, from a probe observation. Pure logic, deterministically tested. |
 
 ## Design decisions
 
@@ -185,6 +186,33 @@ the host is routed proxied for a cooldown. The cooldown backs off exponentially
 cooled-down host doesn't draw a stampede of concurrent probes. The state machine
 takes the current time as a parameter, which is what makes it deterministically
 testable without sleeping.
+
+### Serving segments direct (`auto` segment mode)
+
+For streams whose segments live on an open CDN, relaying the media through this
+server costs the whole video's bandwidth twice and adds a hop to every segment.
+`SEGMENT_MODE=auto` ([`probe.rs`](../src/probe.rs)) probes the first segment of
+each media playlist — a one-byte `Range` fetch on the *direct* client (the path
+the viewer uses, never the outbound proxy) and without the payload's special
+headers — and, if it comes back cleanly, rewrites that playlist to point segments
+straight at the CDN. Verdicts are cached per host and single-flighted, so it's one
+probe per host, not per segment.
+
+Only media bytes are released: segment lines and the media-carrying `URI` tags
+(`EXT-X-MAP`, `EXT-X-PART`, `EXT-X-PRELOAD-HINT`). Nested playlists (anything
+resolving to `.m3u8`) and `EXT-X-KEY` decryption keys always stay proxied — the
+rewritten playlist is the only lever we keep once segments bypass us, so we don't
+give it up. Direct URLs are always absolutized, since a relative URI would resolve
+against this proxy's origin. Browser players (an `Origin` on the request) also
+require a matching CORS grant on the probe, or the segment `fetch()` would be
+blocked; native players don't.
+
+The blind spot is deliberate and documented: the probe runs from our IP, the
+viewer fetches from theirs, so an IP-locked provider passes the probe yet fails
+the viewer with no signal back to us. Hence it is opt-in, every ambiguous signal
+resolves to proxying, and it composes cleanly with `PROXY_MODE` — a host that
+needs the proxy even to fetch a segment simply fails the direct probe and keeps
+being proxied.
 
 ### Browser-identical upstream requests
 

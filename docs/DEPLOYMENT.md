@@ -17,6 +17,7 @@ directory is loaded if present.
 | `DEFAULT_EMULATION_OS` | `windows` | Platform that profile presents as. |
 | `PROXY_URL` | *(none)* | Route upstream requests through an HTTP/HTTPS proxy, e.g. `http://user:pass@host:port`. Fails at startup if malformed. |
 | `PROXY_MODE` | `always` | `always` proxies every request; `fallback` goes direct until a host 429s, then proxies just that host (lower latency for live HLS). |
+| `SEGMENT_MODE` | `proxy` | `proxy` relays every segment; `auto` serves segments that work without special headers as direct CDN links (only for providers with IP-agnostic segment URLs). |
 | `RUST_LOG` | `hls_proxy=info` | Log filter, e.g. `hls_proxy=debug,tower_http=info`. |
 
 ### Getting `BASE_URL` right
