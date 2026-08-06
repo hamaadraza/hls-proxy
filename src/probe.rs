@@ -115,6 +115,12 @@ impl SegmentProber {
         }
     }
 
+    /// The cache holds only plain data, so a panic elsewhere poisoning the lock
+    /// is no reason to start failing every playlist request in `auto` mode.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Entry>> {
+        self.hosts.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Decide how to route this playlist's segments. `origin` is the triggering
     /// request's `Origin` header (present for browser players), which determines
     /// whether CORS is required.
@@ -122,7 +128,7 @@ impl SegmentProber {
     /// Returns `Plan::Probe` to exactly one caller when a fresh probe is needed;
     /// everyone else gets a `Plan::Use` (proxying while a probe is outstanding).
     pub fn decide(&self, host: &str, origin: Option<&str>, now: Instant) -> Plan {
-        let mut hosts = self.hosts.lock().unwrap();
+        let mut hosts = self.lock();
         if let Some(entry) = hosts.get(host) {
             if let Some(observation) = &entry.observation {
                 // A browser arriving after a probe that carried no `Origin` needs
@@ -132,9 +138,15 @@ impl SegmentProber {
                     return Plan::Use(evaluate(observation, origin));
                 }
             }
-            // A probe is already in flight: proxy this one rather than pile on.
+            // A probe is already in flight. Rather than pile on, keep serving the
+            // last answer while it refreshes — dropping a whole live audience back
+            // onto the proxy for the length of every re-probe would undo the
+            // bandwidth saving in periodic bursts.
             if entry.probe_deadline.is_some_and(|deadline| now < deadline) {
-                return Plan::Use(SegmentPolicy::Proxy);
+                return Plan::Use(match &entry.observation {
+                    Some(stale) => evaluate(stale, origin),
+                    None => SegmentPolicy::Proxy,
+                });
             }
         }
 
@@ -163,7 +175,7 @@ impl SegmentProber {
         } else {
             NEGATIVE_TTL
         };
-        let mut hosts = self.hosts.lock().unwrap();
+        let mut hosts = self.lock();
         hosts.insert(
             host.to_string(),
             Entry {

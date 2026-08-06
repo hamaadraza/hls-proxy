@@ -214,6 +214,26 @@ resolves to proxying, and it composes cleanly with `PROXY_MODE` — a host that
 needs the proxy even to fetch a segment simply fails the direct probe and keeps
 being proxied.
 
+Two constraints on the probe are load-bearing rather than incidental:
+
+- **The probe target is untrusted input.** It is read out of the upstream
+  *response body*, so it runs through the same `validate_upstream` guard as the
+  token URL. Skipping it would make the probe an SSRF primitive against loopback,
+  private ranges and cloud metadata — and because the rewritten playlist shows
+  whether a host answered, a readable one. The host length is capped at the DNS
+  limit for the same reason: it becomes a cache key.
+- **A `2xx` alone does not mean "open".** CDNs and WAFs answer blocked requests
+  with `200 text/plain` or a JSON error, and trusting that would send every
+  viewer of a host to a CDN that refuses them for the full positive TTL. Since
+  the probe sends a `Range`, a real segment answers `206`; a `200` is trusted
+  only when the content type names media.
+
+Browser detection deserves a note too: `Origin` is absent on *same-origin*
+requests, which is precisely the deployment `BASE_URL` exists to serve, so
+`Sec-Fetch-Site` is what identifies a browser. Treating a missing `Origin` as
+"native player" would skip the CORS requirement for exactly the setup most likely
+to need it.
+
 ### Browser-identical upstream requests
 
 Upstream requests go out through [wreq](https://github.com/0x676e67/wreq), which
