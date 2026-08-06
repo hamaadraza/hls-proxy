@@ -40,7 +40,8 @@ The consequences are worth stating plainly:
                        ┌─────────────────────────────────────┐
    GET /proxy/{token}  │  1. decode token                    │
   ──────────────────►  │  2. validate URL (scheme, SSRF)     │
-                       │  3. pick pooled client (browser+os) │
+                       │  3. pick pooled client (browser+os, │
+                       │     direct or proxied per policy)   │
                        └──────────────┬──────────────────────┘
                                       │  token headers + Range
                                       ▼
@@ -67,7 +68,8 @@ The consequences are worth stating plainly:
 | [`src/payload.rs`](../src/payload.rs) | The token: JSON schema, base64 encode/decode, URL validation and SSRF guard. |
 | [`src/proxy.rs`](../src/proxy.rs) | Request handlers. Fetches upstream, classifies, streams or rewrites. |
 | [`src/rewrite.rs`](../src/rewrite.rs) | Playlist rewriting and content classification. Pure functions, heavily unit-tested. |
-| [`src/client.rs`](../src/client.rs) | Pool of HTTP clients, one per browser + platform profile. |
+| [`src/client.rs`](../src/client.rs) | Pool of HTTP clients, one per browser + platform profile, each in a direct and (if configured) a proxied variant. Proxy parsing and redaction. |
+| [`src/router.rs`](../src/router.rs) | `fallback` mode's per-host rate-limit breaker: decides direct vs proxied and reacts to 429s. Pure state machine, deterministically tested. |
 
 ## Design decisions
 
@@ -165,6 +167,24 @@ The browser fingerprint is a property of the client, not of the request, so
 supporting more than one profile means holding more than one client. They are
 built on first use and cached by `browser/os`, and each pools its own
 connections. In the common case there is exactly one.
+
+### Proxy modes and per-host fallback
+
+An optional outbound proxy (`PROXY_URL`) lets upstream traffic leave from another
+IP, which is how a single provider's `429`s are avoided. It is baked into the
+client rather than attached per request, so its `Proxy-Authorization` lands
+correctly for both http and https upstreams; the direct and proxied clients are
+cached separately and picked per request.
+
+`PROXY_MODE=always` routes everything through the proxy. `fallback` keeps the
+proxy off the critical path for latency-sensitive live HLS: [`router.rs`](../src/router.rs)
+holds a per-host circuit breaker, inverted — a host is sent direct until it
+returns a `429`, at which point that one request is retried through the proxy and
+the host is routed proxied for a cooldown. The cooldown backs off exponentially
+(honoring `Retry-After`), and a single half-open probe checks for recovery so a
+cooled-down host doesn't draw a stampede of concurrent probes. The state machine
+takes the current time as a parameter, which is what makes it deterministically
+testable without sleeping.
 
 ### Browser-identical upstream requests
 
