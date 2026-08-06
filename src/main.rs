@@ -1,5 +1,6 @@
 mod client;
 mod payload;
+mod probe;
 mod proxy;
 mod rewrite;
 mod router;
@@ -8,6 +9,7 @@ use axum::http::{header, HeaderMap, Method};
 use axum::routing::get;
 use axum::Router;
 use client::ClientPool;
+use probe::SegmentProber;
 use router::HostRouter;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -29,6 +31,17 @@ pub enum ProxyMode {
     Fallback,
 }
 
+/// How a media playlist's segments are served.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SegmentMode {
+    /// Every segment is rewritten back through the proxy.
+    Proxy,
+    /// Probe each host; segments that are fetchable without the payload's headers
+    /// are handed to the player as direct upstream URLs, saving the double hop
+    /// and the bandwidth. Playlists and keys still route through the proxy.
+    Auto,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub clients: Arc<ClientPool>,
@@ -39,6 +52,9 @@ pub struct AppState {
     pub proxy_mode: ProxyMode,
     /// Per-host rate-limit tracker, consulted only in `Fallback` mode.
     pub router: Arc<HostRouter>,
+    /// Whether segments may be served direct, and the per-host probe cache.
+    pub segment_mode: SegmentMode,
+    pub prober: Arc<SegmentProber>,
 }
 
 impl AppState {
@@ -128,6 +144,21 @@ async fn main() {
         }
     };
 
+    // `auto` hands segments that work without special headers straight to the
+    // player; `proxy` (the default) always relays them.
+    let segment_mode = match std::env::var("SEGMENT_MODE")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("") | Some("proxy") => SegmentMode::Proxy,
+        Some("auto") => SegmentMode::Auto,
+        Some(other) => {
+            eprintln!("invalid SEGMENT_MODE '{other}' (expected 'proxy' or 'auto')");
+            std::process::exit(1);
+        }
+    };
+
     let clients = match ClientPool::new(&default_emulation, &default_emulation_os, proxy) {
         Ok(pool) => Arc::new(pool),
         Err(err) => {
@@ -141,6 +172,8 @@ async fn main() {
         base_url,
         proxy_mode,
         router: Arc::new(HostRouter::new()),
+        segment_mode,
+        prober: Arc::new(SegmentProber::new()),
     };
 
     let cors = CorsLayer::new()
@@ -182,6 +215,7 @@ async fn main() {
             .as_deref()
             .unwrap_or("<none>"),
         proxy_mode = ?state.proxy_mode,
+        segment_mode = ?state.segment_mode,
         "hls-proxy listening"
     );
 
@@ -212,6 +246,8 @@ mod tests {
             base_url: base.map(str::to_string),
             proxy_mode: ProxyMode::Off,
             router: Arc::new(HostRouter::new()),
+            segment_mode: SegmentMode::Proxy,
+            prober: Arc::new(SegmentProber::new()),
         }
     }
 

@@ -1,10 +1,11 @@
 use crate::payload::{validate_upstream, PayloadError, StreamPayload};
+use crate::probe::{Observation, Plan, SegmentPolicy};
 use crate::rewrite::{
     body_looks_like_playlist, has_playlist_extension, is_playlist_content_type, proxied_url,
     rewrite_playlist,
 };
 use crate::router::{retry_after_from_secs, Decision};
-use crate::{AppState, ProxyMode};
+use crate::{AppState, ProxyMode, SegmentMode};
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -20,6 +21,17 @@ use url::Url;
 /// Above this size an unlabelled body is assumed to be media rather than a
 /// playlist, so we never buffer a whole segment just to sniff it.
 const MAX_SNIFF_BYTES: u64 = 4 * 1024 * 1024;
+
+/// How long a segment probe (`SEGMENT_MODE=auto`) may take before we give up and
+/// keep proxying. Kept short: it sits on the first media-playlist response for a
+/// host, so it must not stall playback start.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Longest segment host we will probe or cache. The DNS limit is 253 octets, so
+/// anything longer cannot resolve — and since the host comes from an untrusted
+/// playlist body and becomes a cache key, refusing it keeps a hostile upstream
+/// from turning the probe cache into a memory sink.
+const MAX_PROBE_HOST_LEN: usize = 253;
 
 /// Hard ceiling on how much of a body we will hold in memory to rewrite it.
 ///
@@ -198,10 +210,11 @@ fn build_encode_response(
 pub async fn proxy(
     State(state): State<AppState>,
     Path(token): Path<String>,
+    Query(params): Query<Vec<(String, String)>>,
     req_headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let payload = StreamPayload::decode(&token)?;
-    let target = payload.parsed_url()?;
+    let target = with_delivery_directives(payload.parsed_url()?, &params);
 
     let upstream = fetch_upstream(&state, &payload, &target, &req_headers).await?;
 
@@ -291,7 +304,22 @@ pub async fn proxy(
             }
 
             let text = String::from_utf8_lossy(&bytes);
-            let rewritten = rewrite_playlist(&text, &final_url, &payload, &proxy_base);
+            let direct_origin = resolve_direct_origin(
+                &state,
+                &payload,
+                &text,
+                &final_url,
+                &req_headers,
+                &proxy_base,
+            )
+            .await;
+            let rewritten = rewrite_playlist(
+                &text,
+                &final_url,
+                &payload,
+                &proxy_base,
+                direct_origin.as_ref(),
+            );
 
             let mut response = Response::builder().status(status);
             let headers = response.headers_mut().unwrap();
@@ -440,6 +468,291 @@ fn build_upstream_request(
     }
 
     request
+}
+
+/// The host whose segments may be served direct, or `None` to proxy everything.
+///
+/// Only relevant in `SEGMENT_MODE=auto`, and only for media playlists (a master
+/// is all sub-playlists, which always stay proxied). Asks the per-host prober,
+/// running one probe against the first segment when the cache is cold. The probe
+/// uses the *direct* client — it simulates the viewer, who never has our proxy.
+///
+/// The returned host scopes the rewrite: segments on any other CDN in the same
+/// playlist stay proxied, since only this host was actually tested.
+async fn resolve_direct_origin(
+    state: &AppState,
+    payload: &StreamPayload,
+    text: &str,
+    final_url: &Url,
+    req_headers: &HeaderMap,
+    proxy_base: &str,
+) -> Option<Url> {
+    if state.segment_mode != SegmentMode::Auto {
+        return None;
+    }
+
+    // Not a media playlist, or no usable segment to probe: keep proxying.
+    let segment = first_segment(text, final_url)?;
+
+    // The segment URL comes out of the upstream *response body*, so it is no more
+    // trustworthy than the token URL and has to clear the same guard. Without
+    // this an attacker-controlled playlist could point the probe at cloud
+    // metadata or an internal service, and the direct-vs-proxied result in the
+    // rewritten playlist would report back whether it answered.
+    if let Err(err) = validate_upstream(&segment) {
+        tracing::warn!(url = %segment, %err, "refusing to probe a disallowed segment host");
+        return None;
+    }
+
+    // A hostile playlist can name a host of any length, and every distinct host
+    // becomes a cache key. Anything past the DNS limit cannot resolve anyway.
+    let host = segment.host_str()?;
+    if host.len() > MAX_PROBE_HOST_LEN {
+        tracing::warn!("refusing to probe an implausibly long segment host");
+        return None;
+    }
+
+    // A plaintext segment on an https page is blocked as mixed content by every
+    // browser, and the player would fail with no useful error. Relaying it over
+    // our own TLS is the only thing that can work, so don't offer it directly.
+    if segment.scheme() == "http" && proxy_base.starts_with("https://") {
+        tracing::debug!(url = %segment, "segment is http on an https origin; keeping it proxied");
+        return None;
+    }
+
+    decide_direct_origin(state, payload, segment, req_headers, proxy_base).await
+}
+
+/// The cache lookup and probe behind [`resolve_direct_origin`], once the segment
+/// URL has cleared every guard.
+async fn decide_direct_origin(
+    state: &AppState,
+    payload: &StreamPayload,
+    segment: Url,
+    req_headers: &HeaderMap,
+    proxy_base: &str,
+) -> Option<Url> {
+    // Scheme and port are part of the identity being probed: an open
+    // `http://host:8080` says nothing about `https://host`.
+    let key = segment.origin().ascii_serialization();
+    let origin = requesting_origin(req_headers, proxy_base);
+    let origin = origin.as_deref();
+
+    let policy = match state.prober.decide(&key, origin, Instant::now()) {
+        Plan::Use(policy) => policy,
+        Plan::Probe => {
+            let observation = probe_segment(state, payload, &segment, origin).await;
+            tracing::info!(%key, direct = observation.fetchable, "probed segment origin");
+            // Re-read the clock: the probe may have taken up to PROBE_TIMEOUT,
+            // and the TTL should start when the answer landed.
+            state
+                .prober
+                .record(&key, observation, origin, Instant::now())
+        }
+    };
+
+    match policy {
+        SegmentPolicy::Direct => Some(segment),
+        SegmentPolicy::Proxy => None,
+    }
+}
+
+/// The Delivery Directives an LL-HLS client appends to a playlist URL to make
+/// the server hold the response until a given segment or part exists
+/// (RFC 8216bis §6.2.5.2).
+const HLS_DIRECTIVES: [&str; 4] = ["_HLS_msn", "_HLS_part", "_HLS_skip", "_HLS_report"];
+
+fn is_delivery_directive(name: &str) -> bool {
+    HLS_DIRECTIVES
+        .iter()
+        .any(|directive| name.eq_ignore_ascii_case(directive))
+}
+
+/// Carry an LL-HLS client's blocking-reload directives through to the upstream.
+///
+/// The token fixes the upstream URL, so without this the directives are dropped
+/// and upstream answers immediately with the playlist it already has. The client
+/// then sees no new parts and reloads again at once — the busy-poll that blocking
+/// reload exists to prevent.
+///
+/// Only the spec's directives are forwarded, never the whole query string: the
+/// rest of the URL comes from the signed token, and letting a caller append
+/// arbitrary parameters to an upstream request would hand them influence over a
+/// URL they are not supposed to control.
+fn with_delivery_directives(mut target: Url, params: &[(String, String)]) -> Url {
+    let directives: Vec<&(String, String)> = params
+        .iter()
+        .filter(|(name, _)| is_delivery_directive(name))
+        .collect();
+    if directives.is_empty() {
+        return target;
+    }
+
+    // Anything the token already carried is kept, minus any directive of the
+    // same name, so a reload can't accumulate duplicates upstream.
+    let carried: Vec<(String, String)> = target
+        .query_pairs()
+        .filter(|(name, _)| !is_delivery_directive(name))
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect();
+
+    {
+        let mut query = target.query_pairs_mut();
+        query.clear();
+        for (name, value) in &carried {
+            query.append_pair(name, value);
+        }
+        for (name, value) in directives {
+            query.append_pair(name, value);
+        }
+    }
+
+    // `query_pairs_mut` leaves a bare `?` behind when everything was cleared.
+    if target.query() == Some("") {
+        target.set_query(None);
+    }
+    target
+}
+
+/// The origin a browser will send when it fetches the segments, or `None` for a
+/// native player that needs no CORS grant at all.
+///
+/// `Origin` alone is not enough to tell the two apart: browsers omit it on
+/// same-origin requests, which is exactly the setup `BASE_URL` exists to serve.
+/// They do always send `Sec-Fetch-Site`, and no native player does — so its
+/// presence means "browser", and such a player's segment fetches will carry our
+/// own origin, which is therefore what the CDN has to allow.
+fn requesting_origin(req_headers: &HeaderMap, proxy_base: &str) -> Option<String> {
+    if let Some(origin) = req_headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| *v != "null")
+    {
+        return Some(origin.to_string());
+    }
+    if req_headers.contains_key("sec-fetch-site") {
+        return Some(proxy_base.to_string());
+    }
+    None
+}
+
+/// The first media segment of a media playlist, resolved to an absolute URL, or
+/// `None` if this is a master playlist or has no fetchable segment to probe.
+fn first_segment(text: &str, base: &Url) -> Option<Url> {
+    if !is_media_playlist(text) {
+        return None;
+    }
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // The first bare URI in a media playlist is a segment. If it doesn't
+        // resolve to a fetchable http(s) non-playlist URL, don't guess.
+        return base.join(trimmed).ok().filter(|abs| {
+            matches!(abs.scheme(), "http" | "https") && !has_playlist_extension(abs)
+        });
+    }
+    None
+}
+
+/// Media playlists carry per-segment timing; masters carry stream descriptors.
+/// `EXT-X-TARGETDURATION` is mandatory in every media playlist and absent from
+/// masters, so it (or an `EXTINF`) distinguishes the two.
+fn is_media_playlist(text: &str) -> bool {
+    text.lines().any(|line| {
+        let upper = line.trim_start().to_ascii_uppercase();
+        upper.starts_with("#EXTINF") || upper.starts_with("#EXT-X-TARGETDURATION")
+    })
+}
+
+/// Fetch the first byte of a segment the way the viewer's own player would:
+/// direct (never through the outbound proxy) and without the payload's special
+/// headers. The payload's browser emulation is still used, so a host that gates
+/// on TLS fingerprint alone isn't mistaken for one that gates on headers.
+async fn probe_segment(
+    state: &AppState,
+    payload: &StreamPayload,
+    segment: &Url,
+    origin: Option<&str>,
+) -> Observation {
+    let client = match state
+        .clients
+        .get(payload.emulation.as_deref(), payload.os.as_deref(), false)
+    {
+        Ok(client) => client,
+        Err(_) => return Observation::failed(),
+    };
+
+    let mut request = client
+        .get(segment.as_str())
+        .header("range", "bytes=0-0")
+        .timeout(PROBE_TIMEOUT);
+    if let Some(origin) = origin {
+        request = request.header("origin", origin);
+    }
+
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(_) => return Observation::failed(),
+    };
+
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| {
+            ct.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        });
+
+    let allow_origin = response
+        .headers()
+        .get("access-control-allow-origin")
+        .and_then(|v| v.to_str().ok())
+        .map(|value| value.trim().to_string());
+
+    Observation {
+        fetchable: looks_like_open_media(status, content_type.as_deref()),
+        allow_origin,
+        probed_with_origin: origin.is_some(),
+    }
+}
+
+/// Whether a probe response really was an open media segment.
+///
+/// A bare 2xx is not enough: CDNs and WAFs routinely answer a blocked request
+/// with `200 text/plain "Access Denied"` or a JSON error, and treating that as an
+/// open segment would send every viewer of that host to a CDN that refuses them,
+/// cached for the full positive TTL. Since the probe sends a `Range`, a compliant
+/// segment answers `206`; a `200` is trusted only when the content type actually
+/// names media, which also rules out `204` and other bodiless 2xx.
+fn looks_like_open_media(status: u16, content_type: Option<&str>) -> bool {
+    let texty = content_type.is_some_and(|ct| {
+        ct.starts_with("text/") || ct == "application/json" || ct == "application/xml"
+    });
+    if texty {
+        return false;
+    }
+    // If the "segment" is really another playlist, releasing it would hand away
+    // the control point the whole design depends on keeping.
+    if content_type.is_some_and(is_playlist_content_type) {
+        return false;
+    }
+
+    let media = content_type.is_some_and(|ct| {
+        ct.starts_with("video/")
+            || ct.starts_with("audio/")
+            || ct == "application/octet-stream"
+            || ct == "binary/octet-stream"
+            || ct == "application/mp4"
+    });
+
+    status == 206 || (status == 200 && media)
 }
 
 enum Kind {
@@ -761,6 +1074,8 @@ mod tests {
             base_url: None,
             proxy_mode: ProxyMode::Fallback,
             router: Arc::new(crate::router::HostRouter::new()),
+            segment_mode: SegmentMode::Proxy,
+            prober: Arc::new(crate::probe::SegmentProber::new()),
         }
     }
 
@@ -821,5 +1136,368 @@ mod tests {
             1,
             "a healthy response must not retry"
         );
+    }
+
+    // ---- SEGMENT_MODE=auto probing ----
+
+    /// A one-route upstream that answers `/seg` with a fixed status, content type
+    /// and optional CORS header — enough to characterize a segment host.
+    async fn segment_host(
+        status: StatusCode,
+        allow_origin: Option<&'static str>,
+        content_type: &'static str,
+    ) -> std::net::SocketAddr {
+        let app = axum::Router::new().route(
+            "/seg",
+            axum::routing::get(move || async move {
+                let mut builder = Response::builder()
+                    .status(status)
+                    .header(header::CONTENT_TYPE, content_type);
+                if let Some(origin) = allow_origin {
+                    builder = builder.header("access-control-allow-origin", origin);
+                }
+                builder.body(Body::from("x")).unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    fn auto_state() -> AppState {
+        AppState {
+            clients: Arc::new(
+                crate::client::ClientPool::new("chrome_137", "windows", None).unwrap(),
+            ),
+            base_url: None,
+            proxy_mode: ProxyMode::Off,
+            router: Arc::new(crate::router::HostRouter::new()),
+            segment_mode: SegmentMode::Auto,
+            prober: Arc::new(crate::probe::SegmentProber::new()),
+        }
+    }
+
+    fn media_playlist(segment: &str) -> String {
+        format!("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\n{segment}\n")
+    }
+
+    /// Runs the policy decision against a local segment host, returning the
+    /// origin cleared for direct serving (or `None` when everything stays
+    /// proxied).
+    async fn direct_origin_for(
+        state: &AppState,
+        addr: std::net::SocketAddr,
+        headers: &HeaderMap,
+    ) -> Option<Url> {
+        let base = Url::parse(&format!("http://{addr}/live/media.m3u8")).unwrap();
+        let segment = Url::parse(&format!("http://{addr}/seg")).unwrap();
+        let payload = StreamPayload {
+            url: base.to_string(),
+            headers: BTreeMap::new(),
+            emulation: None,
+            os: None,
+        };
+        // Goes straight to the decision, since a test server necessarily lives on
+        // loopback and the SSRF guard in resolve_direct_origin would (correctly)
+        // refuse to probe it. That guard has its own test below.
+        decide_direct_origin(state, &payload, segment, headers, "http://localhost:8080").await
+    }
+
+    /// A fetchable segment with no CORS goes direct for a native player.
+    #[tokio::test]
+    async fn auto_serves_open_segments_direct() {
+        let addr = segment_host(StatusCode::PARTIAL_CONTENT, None, "video/mp2t").await;
+        let origin = direct_origin_for(&auto_state(), addr, &HeaderMap::new()).await;
+        assert_eq!(
+            origin.as_ref().and_then(|u| u.host_str()),
+            Some(addr.ip().to_string().as_str())
+        );
+    }
+
+    /// A segment that refuses the anonymous, header-less fetch stays proxied.
+    #[tokio::test]
+    async fn auto_proxies_gated_segments() {
+        let addr = segment_host(StatusCode::FORBIDDEN, None, "text/plain").await;
+        assert_eq!(
+            direct_origin_for(&auto_state(), addr, &HeaderMap::new()).await,
+            None
+        );
+    }
+
+    /// A plaintext segment on an https-served playlist would be blocked by the
+    /// browser as mixed content, so it must stay proxied over our own TLS. No
+    /// server is needed: the guard must fire before any probe goes out.
+    #[tokio::test]
+    async fn auto_keeps_http_segments_proxied_on_https_origins() {
+        let base = Url::parse("https://cdn.test/live/media.m3u8").unwrap();
+        let payload = StreamPayload {
+            url: base.to_string(),
+            headers: BTreeMap::new(),
+            emulation: None,
+            os: None,
+        };
+
+        let origin = resolve_direct_origin(
+            &auto_state(),
+            &payload,
+            &media_playlist("http://cdn.test/seg.ts"),
+            &base,
+            &HeaderMap::new(),
+            "https://hls-proxy.example.com",
+        )
+        .await;
+        assert_eq!(
+            origin, None,
+            "http segments must not be offered to an https page"
+        );
+    }
+
+    /// A 200 that is really an HTML error page is a soft failure, so it proxies.
+    #[tokio::test]
+    async fn auto_proxies_html_soft_failures() {
+        let addr = segment_host(StatusCode::OK, None, "text/html; charset=utf-8").await;
+        assert_eq!(
+            direct_origin_for(&auto_state(), addr, &HeaderMap::new()).await,
+            None
+        );
+    }
+
+    /// A browser player (Origin present) needs CORS: without it, proxy; with a
+    /// wildcard grant, direct.
+    #[tokio::test]
+    async fn auto_requires_cors_for_browsers() {
+        let mut browser = HeaderMap::new();
+        browser.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://player.test"),
+        );
+
+        let no_cors = segment_host(StatusCode::OK, None, "video/mp2t").await;
+        assert_eq!(
+            direct_origin_for(&auto_state(), no_cors, &browser).await,
+            None
+        );
+
+        let cors = segment_host(StatusCode::OK, Some("*"), "video/mp2t").await;
+        assert!(direct_origin_for(&auto_state(), cors, &browser)
+            .await
+            .is_some());
+    }
+
+    /// A host first probed by a native player (no `Origin`, so the CDN sent no
+    /// CORS headers) must be re-probed when a browser shows up, or browsers would
+    /// never benefit from the mode on a mixed-client deployment.
+    #[tokio::test]
+    async fn a_native_probe_does_not_bury_the_cors_answer_for_browsers() {
+        let addr = segment_host(StatusCode::OK, Some("*"), "video/mp2t").await;
+        let state = auto_state();
+
+        // Native client probes first: the CDN echoes no CORS, so none is cached.
+        assert!(direct_origin_for(&state, addr, &HeaderMap::new())
+            .await
+            .is_some());
+
+        // A browser then arrives and must still be able to reach the direct path.
+        let mut browser = HeaderMap::new();
+        browser.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://player.test"),
+        );
+        assert!(
+            direct_origin_for(&state, addr, &browser).await.is_some(),
+            "a browser must trigger a CORS re-probe rather than inherit a blind verdict"
+        );
+    }
+
+    /// A master playlist is never probed — it has no segments — and always proxies.
+    #[tokio::test]
+    async fn auto_never_probes_master_playlists() {
+        let state = auto_state();
+        let text = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nhttp://cdn.test/720.m3u8\n";
+        let base = Url::parse("https://origin.test/master.m3u8").unwrap();
+        let payload = StreamPayload {
+            url: base.to_string(),
+            headers: BTreeMap::new(),
+            emulation: None,
+            os: None,
+        };
+        let host = resolve_direct_origin(
+            &state,
+            &payload,
+            text,
+            &base,
+            &HeaderMap::new(),
+            "http://localhost:8080",
+        )
+        .await;
+        assert_eq!(host, None);
+    }
+
+    /// `SEGMENT_MODE=proxy` (the default) never probes and always proxies. The
+    /// mode gate has to come first, so no request is made at all.
+    #[tokio::test]
+    async fn proxy_mode_never_probes() {
+        let mut state = auto_state();
+        state.segment_mode = SegmentMode::Proxy;
+
+        let base = Url::parse("https://cdn.test/live/media.m3u8").unwrap();
+        let payload = StreamPayload {
+            url: base.to_string(),
+            headers: BTreeMap::new(),
+            emulation: None,
+            os: None,
+        };
+        let origin = resolve_direct_origin(
+            &state,
+            &payload,
+            &media_playlist("https://cdn.test/seg.ts"),
+            &base,
+            &HeaderMap::new(),
+            "https://hls-proxy.example.com",
+        )
+        .await;
+        assert_eq!(origin, None);
+    }
+
+    /// The segment URL comes from the upstream response body, so it is exactly as
+    /// untrusted as the token URL: a hostile playlist must not be able to aim the
+    /// probe at loopback, private ranges or cloud metadata.
+    #[tokio::test]
+    async fn auto_refuses_to_probe_blocked_segment_hosts() {
+        let state = auto_state();
+        let base = Url::parse("https://evil.test/p.m3u8").unwrap();
+        let payload = StreamPayload {
+            url: base.to_string(),
+            headers: BTreeMap::new(),
+            emulation: None,
+            os: None,
+        };
+
+        for hostile in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:6379/",
+            "http://10.0.0.5:8500/v1/kv/",
+            "http://[::1]/secret",
+        ] {
+            let text = media_playlist(hostile);
+            let origin = resolve_direct_origin(
+                &state,
+                &payload,
+                &text,
+                &base,
+                &HeaderMap::new(),
+                "https://hls-proxy.example.com",
+            )
+            .await;
+            assert_eq!(origin, None, "must refuse to probe {hostile}");
+        }
+    }
+
+    /// A browser on the same origin as the proxy sends no `Origin`, but it still
+    /// needs a CORS grant for the cross-origin segment fetch. `Sec-Fetch-Site` is
+    /// what distinguishes it from a native player.
+    #[tokio::test]
+    async fn auto_treats_sec_fetch_requests_as_browsers() {
+        let addr = segment_host(StatusCode::OK, None, "video/mp2t").await;
+        let mut same_origin_browser = HeaderMap::new();
+        same_origin_browser.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+
+        assert_eq!(
+            direct_origin_for(&auto_state(), addr, &same_origin_browser).await,
+            None,
+            "a same-origin browser still needs CORS on the CDN"
+        );
+    }
+
+    // ---- LL-HLS delivery directives ----
+
+    fn directives(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// Without these forwarded, upstream answers immediately and the LL-HLS
+    /// client busy-polls instead of blocking.
+    #[test]
+    fn blocking_reload_directives_reach_upstream() {
+        let target = url("https://cdn.test/live/media.m3u8");
+        let out = with_delivery_directives(
+            target,
+            &directives(&[("_HLS_msn", "42"), ("_HLS_part", "3")]),
+        );
+        assert_eq!(
+            out.as_str(),
+            "https://cdn.test/live/media.m3u8?_HLS_msn=42&_HLS_part=3"
+        );
+    }
+
+    /// The token owns the upstream URL; a caller must not be able to bolt on
+    /// parameters of their choosing.
+    #[test]
+    fn only_spec_directives_are_forwarded() {
+        let target = url("https://cdn.test/media.m3u8?token=abc");
+        let out = with_delivery_directives(
+            target,
+            &directives(&[("_HLS_msn", "7"), ("evil", "1"), ("token", "stolen")]),
+        );
+        assert_eq!(
+            out.as_str(),
+            "https://cdn.test/media.m3u8?token=abc&_HLS_msn=7"
+        );
+    }
+
+    /// A URL that already carries a directive must not end up with two.
+    #[test]
+    fn directives_do_not_accumulate() {
+        let target = url("https://cdn.test/media.m3u8?_HLS_msn=1&keep=yes");
+        let out = with_delivery_directives(target, &directives(&[("_HLS_msn", "2")]));
+        assert_eq!(
+            out.as_str(),
+            "https://cdn.test/media.m3u8?keep=yes&_HLS_msn=2"
+        );
+    }
+
+    /// A plain segment request has no directives and must come through untouched,
+    /// bare `?` included.
+    #[test]
+    fn requests_without_directives_are_unchanged() {
+        let target = url("https://cdn.test/1.ts");
+        assert_eq!(
+            with_delivery_directives(target, &[]).as_str(),
+            "https://cdn.test/1.ts"
+        );
+
+        let signed = url("https://cdn.test/1.ts?sig=xyz");
+        assert_eq!(
+            with_delivery_directives(signed, &directives(&[("other", "1")])).as_str(),
+            "https://cdn.test/1.ts?sig=xyz"
+        );
+    }
+
+    /// A 200 carrying an error page or an empty body is not an open segment, even
+    /// when it isn't HTML.
+    #[test]
+    fn soft_failures_are_not_open_media() {
+        // Genuine segment responses.
+        assert!(looks_like_open_media(206, Some("video/mp2t")));
+        assert!(looks_like_open_media(206, None));
+        assert!(looks_like_open_media(200, Some("application/octet-stream")));
+
+        // Error pages wearing a 200.
+        assert!(!looks_like_open_media(200, Some("text/html")));
+        assert!(!looks_like_open_media(200, Some("text/plain")));
+        assert!(!looks_like_open_media(200, Some("application/json")));
+        // A bodiless 2xx is not a segment.
+        assert!(!looks_like_open_media(204, None));
+        // Nor is an unlabelled 200 — too ambiguous to bet a stream on.
+        assert!(!looks_like_open_media(200, None));
+        // A playlist is not a segment; releasing it would give away control.
+        assert!(!looks_like_open_media(
+            200,
+            Some("application/vnd.apple.mpegurl")
+        ));
     }
 }

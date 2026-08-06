@@ -154,6 +154,7 @@ present — see [.env.example](.env.example).
 | `DEFAULT_EMULATION_OS` | `windows` | Platform that profile presents as. |
 | `PROXY_URL` | *(none)* | Route upstream requests through this HTTP/HTTPS proxy, e.g. `http://user:pass@host:port`. Unset means direct connections. |
 | `PROXY_MODE` | `always` | With `PROXY_URL` set: `always` proxies everything; `fallback` goes direct until a host 429s, then proxies just that host. |
+| `SEGMENT_MODE` | `proxy` | `proxy` relays every segment; `auto` hands segments that work without special headers straight to the player as direct CDN links. |
 | `RUST_LOG` | `hls_proxy=info` | Log filter. |
 
 Set `BASE_URL` when you deploy behind a domain:
@@ -206,6 +207,45 @@ How fallback behaves:
 Use `always` (the default) when hiding your origin server's IP from the provider
 matters more than per-request latency — in `fallback` mode the provider sees your
 real IP whenever it isn't rate-limiting you.
+
+### Serving segments directly (`SEGMENT_MODE=auto`)
+
+Often the heavy part of a stream — the segments — sits on an open CDN that needs
+no special headers, while only the playlist requires them. Relaying those
+segments buys nothing and costs you the whole video's bandwidth twice (CDN → your
+server → viewer). `SEGMENT_MODE=auto` detects this and rewrites the playlist so
+the player fetches segments **straight from the CDN**, leaving your server to
+handle only the playlists (a few KB every few seconds):
+
+```bash
+SEGMENT_MODE=auto hls-proxy
+```
+
+How it decides, per host:
+
+- On the first media playlist for a host, it **probes the first segment** — a
+  one-byte `Range` request from the same (direct) path the viewer will use, and
+  **without** the payload's special headers. The verdict is cached per host (~10
+  min) and single-flighted, so it costs one small request per host, not per
+  segment.
+- **Open** (a 2xx that isn't an HTML error page) → segments are emitted as direct
+  absolute CDN URLs. **Anything else** → segments stay proxied. Every ambiguous
+  signal falls back to proxying.
+- **Browser players** (requests carrying an `Origin`) additionally require the
+  CDN to send a compatible `Access-Control-Allow-Origin`, or the segment `fetch()`
+  would be blocked; native players (apps, TVs, VLC) don't need this.
+- **Playlists and `EXT-X-KEY` decryption keys are always proxied** — they're
+  small, often gated, and the rewritten playlist is the only point of control we
+  keep once segments go direct.
+
+It composes with `PROXY_MODE`: `PROXY_MODE` decides how *this server* reaches the
+upstream, `SEGMENT_MODE` decides whether the *player* is sent to the CDN at all.
+
+> ⚠️ **Only enable this for providers whose segment URLs are not IP-locked.**
+> The probe runs from your server's IP; the viewer fetches from theirs. If a
+> provider binds segment URLs to the requesting IP, the probe succeeds but the
+> viewer's fetch fails — and because direct segments bypass this server, there is
+> no feedback loop for us to detect it. When in doubt, leave it on `proxy`.
 
 Deployment guides for systemd, Docker, nginx and Caddy:
 **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**.

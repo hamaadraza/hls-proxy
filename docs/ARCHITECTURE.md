@@ -70,6 +70,7 @@ The consequences are worth stating plainly:
 | [`src/rewrite.rs`](../src/rewrite.rs) | Playlist rewriting and content classification. Pure functions, heavily unit-tested. |
 | [`src/client.rs`](../src/client.rs) | Pool of HTTP clients, one per browser + platform profile, each in a direct and (if configured) a proxied variant. Proxy parsing and redaction. |
 | [`src/router.rs`](../src/router.rs) | `fallback` mode's per-host rate-limit breaker: decides direct vs proxied and reacts to 429s. Pure state machine, deterministically tested. |
+| [`src/probe.rs`](../src/probe.rs) | `auto` segment mode's per-host cache: decides whether a host's segments can be served direct, from a probe observation. Pure logic, deterministically tested. |
 
 ## Design decisions
 
@@ -185,6 +186,71 @@ the host is routed proxied for a cooldown. The cooldown backs off exponentially
 cooled-down host doesn't draw a stampede of concurrent probes. The state machine
 takes the current time as a parameter, which is what makes it deterministically
 testable without sleeping.
+
+### Serving segments direct (`auto` segment mode)
+
+For streams whose segments live on an open CDN, relaying the media through this
+server costs the whole video's bandwidth twice and adds a hop to every segment.
+`SEGMENT_MODE=auto` ([`probe.rs`](../src/probe.rs)) probes the first segment of
+each media playlist — a one-byte `Range` fetch on the *direct* client (the path
+the viewer uses, never the outbound proxy) and without the payload's special
+headers — and, if it comes back cleanly, rewrites that playlist to point segments
+straight at the CDN. Verdicts are cached per host and single-flighted, so it's one
+probe per host, not per segment.
+
+Only media bytes are released: segment lines and the media-carrying `URI` tags
+(`EXT-X-MAP`, `EXT-X-PART`, `EXT-X-PRELOAD-HINT`). Nested playlists (anything
+resolving to `.m3u8`) and `EXT-X-KEY` decryption keys always stay proxied — the
+rewritten playlist is the only lever we keep once segments bypass us, so we don't
+give it up. Direct URLs are always absolutized, since a relative URI would resolve
+against this proxy's origin. Browser players (an `Origin` on the request) also
+require a matching CORS grant on the probe, or the segment `fetch()` would be
+blocked; native players don't.
+
+The blind spot is deliberate and documented: the probe runs from our IP, the
+viewer fetches from theirs, so an IP-locked provider passes the probe yet fails
+the viewer with no signal back to us. Hence it is opt-in, every ambiguous signal
+resolves to proxying, and it composes cleanly with `PROXY_MODE` — a host that
+needs the proxy even to fetch a segment simply fails the direct probe and keeps
+being proxied.
+
+Two constraints on the probe are load-bearing rather than incidental:
+
+- **The probe target is untrusted input.** It is read out of the upstream
+  *response body*, so it runs through the same `validate_upstream` guard as the
+  token URL. Skipping it would make the probe an SSRF primitive against loopback,
+  private ranges and cloud metadata — and because the rewritten playlist shows
+  whether a host answered, a readable one. The host length is capped at the DNS
+  limit for the same reason: it becomes a cache key.
+- **A `2xx` alone does not mean "open".** CDNs and WAFs answer blocked requests
+  with `200 text/plain` or a JSON error, and trusting that would send every
+  viewer of a host to a CDN that refuses them for the full positive TTL. Since
+  the probe sends a `Range`, a real segment answers `206`; a `200` is trusted
+  only when the content type names media.
+
+Browser detection deserves a note too: `Origin` is absent on *same-origin*
+requests, which is precisely the deployment `BASE_URL` exists to serve, so
+`Sec-Fetch-Site` is what identifies a browser. Treating a missing `Origin` as
+"native player" would skip the CORS requirement for exactly the setup most likely
+to need it.
+
+### Low-latency HLS
+
+Two details make LL-HLS work through the rewrite:
+
+- **Delivery directives are forwarded.** A client appends `_HLS_msn`,
+  `_HLS_part`, `_HLS_skip` or `_HLS_report` to a playlist URL to make the server
+  hold the response until that part exists. The token fixes the upstream URL, so
+  those have to be carried across explicitly or upstream answers immediately and
+  the client busy-polls — the exact behaviour blocking reload exists to avoid.
+  Only the spec's directives are forwarded: the rest of the URL comes from the
+  token, and letting a caller append arbitrary parameters would give them
+  influence over a URL they don't control.
+- **`EXT-X-RENDITION-REPORT` keeps a relative URI**, which RFC 8216bis §4.4.5.4
+  requires. Playlists are served as `{base}/proxy/{token}`, so emitting a bare
+  token resolves against that by replacing the last path segment — landing on the
+  proxied rendition exactly as the absolute form would, while staying relative.
+  That holds under a `BASE_URL` path prefix and with query directives appended.
 
 ### Browser-identical upstream requests
 
