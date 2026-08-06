@@ -2,11 +2,13 @@ mod client;
 mod payload;
 mod proxy;
 mod rewrite;
+mod router;
 
 use axum::http::{header, HeaderMap, Method};
 use axum::routing::get;
 use axum::Router;
 use client::ClientPool;
+use router::HostRouter;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
@@ -15,12 +17,28 @@ use tower_http::trace::TraceLayer;
 const DEFAULT_EMULATION: &str = "chrome_137";
 const DEFAULT_EMULATION_OS: &str = "windows";
 
+/// How upstream requests use the configured proxy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProxyMode {
+    /// No proxy configured; every request goes direct.
+    Off,
+    /// Every upstream request goes through the proxy.
+    Always,
+    /// Requests go direct until a host rate-limits us, then that host is routed
+    /// through the proxy until it cools off. Best for latency-sensitive live HLS.
+    Fallback,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub clients: Arc<ClientPool>,
     /// Public origin the rewritten URLs point at. None means derive it from the
     /// request, which keeps local runs working with no configuration.
     pub base_url: Option<String>,
+    /// How the proxy (if any) is applied to upstream requests.
+    pub proxy_mode: ProxyMode,
+    /// Per-host rate-limit tracker, consulted only in `Fallback` mode.
+    pub router: Arc<HostRouter>,
 }
 
 impl AppState {
@@ -87,6 +105,29 @@ async fn main() {
         None => None,
     };
 
+    // `always` (the default when a proxy is set) sends everything through the
+    // proxy; `fallback` only diverts a host after it rate-limits us.
+    let mode_str = std::env::var("PROXY_MODE")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty());
+
+    let proxy_mode = match (&proxy, mode_str.as_deref()) {
+        (None, None) => ProxyMode::Off,
+        (None, Some(_)) => {
+            eprintln!(
+                "PROXY_MODE is set but PROXY_URL is empty; set PROXY_URL or unset PROXY_MODE"
+            );
+            std::process::exit(1);
+        }
+        (Some(_), None | Some("always")) => ProxyMode::Always,
+        (Some(_), Some("fallback")) => ProxyMode::Fallback,
+        (Some(_), Some(other)) => {
+            eprintln!("invalid PROXY_MODE '{other}' (expected 'always' or 'fallback')");
+            std::process::exit(1);
+        }
+    };
+
     let clients = match ClientPool::new(&default_emulation, &default_emulation_os, proxy) {
         Ok(pool) => Arc::new(pool),
         Err(err) => {
@@ -95,7 +136,12 @@ async fn main() {
         }
     };
 
-    let state = AppState { clients, base_url };
+    let state = AppState {
+        clients,
+        base_url,
+        proxy_mode,
+        router: Arc::new(HostRouter::new()),
+    };
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -135,6 +181,7 @@ async fn main() {
             .map(client::redact_proxy)
             .as_deref()
             .unwrap_or("<none>"),
+        proxy_mode = ?state.proxy_mode,
         "hls-proxy listening"
     );
 
@@ -163,6 +210,8 @@ mod tests {
                 ClientPool::new(DEFAULT_EMULATION, DEFAULT_EMULATION_OS, None).unwrap(),
             ),
             base_url: base.map(str::to_string),
+            proxy_mode: ProxyMode::Off,
+            router: Arc::new(HostRouter::new()),
         }
     }
 

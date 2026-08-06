@@ -15,7 +15,8 @@ directory is loaded if present.
 | `PORT` | `8080` | Port to listen on. |
 | `DEFAULT_EMULATION` | `chrome_137` | Browser profile for upstream requests. |
 | `DEFAULT_EMULATION_OS` | `windows` | Platform that profile presents as. |
-| `PROXY_URL` | *(none)* | Route all upstream requests through an HTTP/HTTPS proxy, e.g. `http://user:pass@host:port`. Fails at startup if malformed. |
+| `PROXY_URL` | *(none)* | Route upstream requests through an HTTP/HTTPS proxy, e.g. `http://user:pass@host:port`. Fails at startup if malformed. |
+| `PROXY_MODE` | `always` | `always` proxies every request; `fallback` goes direct until a host 429s, then proxies just that host (lower latency for live HLS). |
 | `RUST_LOG` | `hls_proxy=info` | Log filter, e.g. `hls_proxy=debug,tower_http=info`. |
 
 ### Getting `BASE_URL` right

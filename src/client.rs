@@ -24,13 +24,19 @@ impl Profile {
 /// Emulation is a per-client setting in wreq, so supporting more than one
 /// profile means holding more than one client. They are built on first use and
 /// cached; a `Client` is cheap to clone and pools its connections.
+///
+/// Direct and proxied clients are cached separately. Baking the proxy into the
+/// client (rather than attaching it per request) is what makes the proxy's
+/// `Proxy-Authorization` land correctly for both http and https upstreams, and
+/// `fallback` mode needs a genuinely direct client to fall back *to* — so both
+/// variants coexist, chosen per request by `use_proxy`.
 pub struct ClientPool {
     default_profile: Profile,
-    /// When set, every client routes its upstream requests through this proxy.
-    /// Shared by all profiles so a single provider sees traffic leave from the
-    /// proxy's address instead of ours, which is what keeps rate limits at bay.
+    /// The upstream proxy, if one is configured. `None` means proxied clients
+    /// can't be built, so every request is served direct.
     proxy: Option<Proxy>,
-    clients: RwLock<HashMap<String, Client>>,
+    direct: RwLock<HashMap<String, Client>>,
+    proxied: RwLock<HashMap<String, Client>>,
 }
 
 impl ClientPool {
@@ -41,10 +47,15 @@ impl ClientPool {
                 os: os.to_string(),
             },
             proxy,
-            clients: RwLock::new(HashMap::new()),
+            direct: RwLock::new(HashMap::new()),
+            proxied: RwLock::new(HashMap::new()),
         };
-        // Fail at startup rather than on the first request.
-        pool.get(None, None)?;
+        // Fail at startup rather than on the first request. Warm the proxied
+        // client too when a proxy is set, so a broken proxy surfaces at boot.
+        pool.get(None, None, false)?;
+        if pool.proxy.is_some() {
+            pool.get(None, None, true)?;
+        }
         Ok(pool)
     }
 
@@ -52,23 +63,32 @@ impl ClientPool {
         &self.default_profile
     }
 
-    pub fn get(&self, browser: Option<&str>, os: Option<&str>) -> Result<Client, String> {
+    /// Fetch a cached client for the given profile, building it on first use.
+    /// `use_proxy` selects the proxied variant; it silently falls back to a
+    /// direct client when no proxy is configured.
+    pub fn get(
+        &self,
+        browser: Option<&str>,
+        os: Option<&str>,
+        use_proxy: bool,
+    ) -> Result<Client, String> {
         let profile = Profile {
             browser: browser.unwrap_or(&self.default_profile.browser).to_string(),
             os: os.unwrap_or(&self.default_profile.os).to_string(),
         };
         let key = profile.cache_key();
 
-        if let Some(client) = self.clients.read().unwrap().get(&key) {
+        let proxied = use_proxy && self.proxy.is_some();
+        let cache = if proxied { &self.proxied } else { &self.direct };
+
+        if let Some(client) = cache.read().unwrap().get(&key) {
             return Ok(client.clone());
         }
 
-        let client = build_client(&profile, self.proxy.clone())?;
-        self.clients
-            .write()
-            .unwrap()
-            .insert(key.clone(), client.clone());
-        tracing::info!(profile = %key, "built emulated client");
+        let attach = if proxied { self.proxy.clone() } else { None };
+        let client = build_client(&profile, attach)?;
+        cache.write().unwrap().insert(key.clone(), client.clone());
+        tracing::info!(profile = %key, proxied, "built emulated client");
         Ok(client)
     }
 }
@@ -258,13 +278,15 @@ mod tests {
     #[test]
     fn pool_caches_per_browser_and_os() {
         let pool = ClientPool::new("chrome_137", "windows", None).unwrap();
-        pool.get(None, None).unwrap();
-        pool.get(Some("chrome_137"), Some("windows")).unwrap();
-        assert_eq!(pool.clients.read().unwrap().len(), 1);
+        pool.get(None, None, false).unwrap();
+        pool.get(Some("chrome_137"), Some("windows"), false)
+            .unwrap();
+        assert_eq!(pool.direct.read().unwrap().len(), 1);
 
         // Same browser on a different platform is a distinct fingerprint.
-        pool.get(Some("chrome_137"), Some("macos")).unwrap();
-        pool.get(Some("firefox_136"), Some("windows")).unwrap();
-        assert_eq!(pool.clients.read().unwrap().len(), 3);
+        pool.get(Some("chrome_137"), Some("macos"), false).unwrap();
+        pool.get(Some("firefox_136"), Some("windows"), false)
+            .unwrap();
+        assert_eq!(pool.direct.read().unwrap().len(), 3);
     }
 }

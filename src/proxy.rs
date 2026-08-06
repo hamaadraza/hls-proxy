@@ -3,7 +3,8 @@ use crate::rewrite::{
     body_looks_like_playlist, has_playlist_extension, is_playlist_content_type, proxied_url,
     rewrite_playlist,
 };
-use crate::AppState;
+use crate::router::{retry_after_from_secs, Decision};
+use crate::{AppState, ProxyMode};
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -13,6 +14,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 use url::Url;
 
 /// Above this size an unlabelled body is assumed to be media rather than a
@@ -55,6 +57,7 @@ async fn read_capped(upstream: wreq::Response, cap: usize) -> Result<Capped, wre
     Ok(Capped::Complete(Bytes::from(buf)))
 }
 
+#[derive(Debug)]
 pub struct AppError {
     status: StatusCode,
     message: String,
@@ -200,41 +203,7 @@ pub async fn proxy(
     let payload = StreamPayload::decode(&token)?;
     let target = payload.parsed_url()?;
 
-    let client = state
-        .clients
-        .get(payload.emulation.as_deref(), payload.os.as_deref())
-        .map_err(AppError::bad_request)?;
-
-    let mut request = client.get(target.as_str());
-    for (name, value) in &payload.headers {
-        if is_hop_by_hop(name) {
-            continue;
-        }
-        request = request.header(name.as_str(), value.as_str());
-    }
-
-    // Range must be forwarded or seeking in VOD streams breaks. The validators
-    // go with it: we hand clients the upstream `ETag`/`Last-Modified` on segment
-    // responses, so dropping the matching conditional headers on the way back up
-    // would mean revalidation could never produce a 304.
-    for name in [
-        header::RANGE,
-        header::IF_NONE_MATCH,
-        header::IF_MODIFIED_SINCE,
-        header::IF_RANGE,
-    ] {
-        if let Some(value) = req_headers.get(&name).and_then(|v| v.to_str().ok()) {
-            request = request.header(name.as_str(), value);
-        }
-    }
-
-    let upstream = request.send().await.map_err(|e| {
-        tracing::warn!(url = %target, error = %e, "upstream request failed");
-        AppError::new(
-            StatusCode::BAD_GATEWAY,
-            format!("upstream request failed: {e}"),
-        )
-    })?;
+    let upstream = fetch_upstream(&state, &payload, &target, &req_headers).await?;
 
     let status = StatusCode::from_u16(upstream.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -342,6 +311,135 @@ pub async fn proxy(
                 .expect("response is well formed"))
         }
     }
+}
+
+/// Fetch the upstream, applying the configured proxy policy.
+///
+/// `Off` always goes direct, `Always` always goes through the proxy. `Fallback`
+/// asks the router per host: direct until a host rate-limits us, then proxied.
+/// A direct 429 in fallback mode transparently retries once through the proxy,
+/// so the caller never sees the rate limit.
+async fn fetch_upstream(
+    state: &AppState,
+    payload: &StreamPayload,
+    target: &Url,
+    req_headers: &HeaderMap,
+) -> Result<wreq::Response, AppError> {
+    let host = target.host_str().unwrap_or_default().to_string();
+    let now = Instant::now();
+
+    let decision = match state.proxy_mode {
+        ProxyMode::Off => Decision::Direct { probe: false },
+        ProxyMode::Always => Decision::Proxied,
+        ProxyMode::Fallback => state.router.route(&host, now),
+    };
+
+    let use_proxy = matches!(decision, Decision::Proxied);
+    let upstream = send_once(state, payload, target, req_headers, use_proxy).await?;
+
+    // Only fallback mode learns from the response and may retry.
+    if state.proxy_mode != ProxyMode::Fallback {
+        return Ok(upstream);
+    }
+
+    let rate_limited = upstream.status().as_u16() == 429;
+    let retry_after = upstream
+        .headers()
+        .get(wreq::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(retry_after_from_secs)
+        .unwrap_or(Duration::ZERO);
+
+    match decision {
+        // The direct path got rate-limited. Trip the breaker so later requests
+        // to this host skip straight to the proxy, and retry this one through it
+        // now so the viewer still gets their segment.
+        Decision::Direct { .. } if rate_limited => {
+            state
+                .router
+                .on_result(&host, decision, true, retry_after, now);
+            tracing::info!(%host, "direct upstream rate-limited; retrying through proxy");
+            match send_once(state, payload, target, req_headers, true).await {
+                Ok(retried) => Ok(retried),
+                // The proxy retry itself failed; the original 429 is the best
+                // answer we still have in hand.
+                Err(_) => {
+                    tracing::warn!(%host, "proxy retry failed after direct 429");
+                    Ok(upstream)
+                }
+            }
+        }
+        _ => {
+            state
+                .router
+                .on_result(&host, decision, rate_limited, retry_after, now);
+            Ok(upstream)
+        }
+    }
+}
+
+/// Send one upstream request over the direct or proxied client.
+async fn send_once(
+    state: &AppState,
+    payload: &StreamPayload,
+    target: &Url,
+    req_headers: &HeaderMap,
+    use_proxy: bool,
+) -> Result<wreq::Response, AppError> {
+    let client = state
+        .clients
+        .get(
+            payload.emulation.as_deref(),
+            payload.os.as_deref(),
+            use_proxy,
+        )
+        .map_err(AppError::bad_request)?;
+
+    build_upstream_request(&client, target, payload, req_headers)
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::warn!(url = %target, error = %e, "upstream request failed");
+            AppError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("upstream request failed: {e}"),
+            )
+        })
+}
+
+/// Build the upstream request: payload headers plus the client's conditional and
+/// range headers. Kept separate so a fallback retry reconstructs an identical
+/// request against a different client.
+fn build_upstream_request(
+    client: &wreq::Client,
+    target: &Url,
+    payload: &StreamPayload,
+    req_headers: &HeaderMap,
+) -> wreq::RequestBuilder {
+    let mut request = client.get(target.as_str());
+    for (name, value) in &payload.headers {
+        if is_hop_by_hop(name) {
+            continue;
+        }
+        request = request.header(name.as_str(), value.as_str());
+    }
+
+    // Range must be forwarded or seeking in VOD streams breaks. The validators
+    // go with it: we hand clients the upstream `ETag`/`Last-Modified` on segment
+    // responses, so dropping the matching conditional headers on the way back up
+    // would mean revalidation could never produce a 304.
+    for name in [
+        header::RANGE,
+        header::IF_NONE_MATCH,
+        header::IF_MODIFIED_SINCE,
+        header::IF_RANGE,
+    ] {
+        if let Some(value) = req_headers.get(&name).and_then(|v| v.to_str().ok()) {
+            request = request.header(name.as_str(), value);
+        }
+    }
+
+    request
 }
 
 enum Kind {
@@ -623,5 +721,105 @@ mod tests {
         assert!(is_hop_by_hop("Connection"));
         assert!(is_hop_by_hop("HOST"));
         assert!(!is_hop_by_hop("Referer"));
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Spin up a local upstream whose first `first_429` responses are 429 and
+    /// the rest are 200, counting every hit. Returns its address and the
+    /// counter. Loopback is fine here: the SSRF guard lives in the `proxy`
+    /// handler, and `fetch_upstream` is handed an already-validated target.
+    async fn flaky_upstream(first_429: usize) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        let app = axum::Router::new().route(
+            "/seg",
+            axum::routing::get(move || {
+                let seen = seen.clone();
+                async move {
+                    let n = seen.fetch_add(1, Ordering::SeqCst);
+                    if n < first_429 {
+                        (StatusCode::TOO_MANY_REQUESTS, "slow down").into_response()
+                    } else {
+                        (StatusCode::OK, "segment").into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (addr, hits)
+    }
+
+    fn fallback_state() -> AppState {
+        AppState {
+            clients: Arc::new(
+                crate::client::ClientPool::new("chrome_137", "windows", None).unwrap(),
+            ),
+            base_url: None,
+            proxy_mode: ProxyMode::Fallback,
+            router: Arc::new(crate::router::HostRouter::new()),
+        }
+    }
+
+    fn payload_for(addr: std::net::SocketAddr) -> (StreamPayload, Url) {
+        let url = format!("http://{addr}/seg");
+        let target = Url::parse(&url).unwrap();
+        let payload = StreamPayload {
+            url,
+            headers: BTreeMap::new(),
+            emulation: None,
+            os: None,
+        };
+        (payload, target)
+    }
+
+    /// A direct 429 in fallback mode is retried through the proxy path and the
+    /// caller sees the successful response, not the 429. With no proxy actually
+    /// configured the retry reuses the direct client — what we assert is the
+    /// transparent second attempt, i.e. two upstream hits ending in 200.
+    #[tokio::test]
+    async fn fallback_retries_after_a_direct_429() {
+        let (addr, hits) = flaky_upstream(1).await;
+        let state = fallback_state();
+        let (payload, target) = payload_for(addr);
+
+        let resp = fetch_upstream(&state, &payload, &target, &HeaderMap::new())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "expected a direct 429 then a retry"
+        );
+
+        // The host is now tripped, so the next request skips straight to proxied.
+        assert_eq!(
+            state.router.route(&addr.ip().to_string(), Instant::now()),
+            Decision::Proxied
+        );
+    }
+
+    /// A healthy direct response is returned untouched, with no wasted retry.
+    #[tokio::test]
+    async fn fallback_leaves_healthy_responses_alone() {
+        let (addr, hits) = flaky_upstream(0).await;
+        let state = fallback_state();
+        let (payload, target) = payload_for(addr);
+
+        let resp = fetch_upstream(&state, &payload, &target, &HeaderMap::new())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a healthy response must not retry"
+        );
     }
 }

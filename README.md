@@ -152,7 +152,8 @@ present — see [.env.example](.env.example).
 | `PORT` | `8080` | Port to listen on. |
 | `DEFAULT_EMULATION` | `chrome_137` | Browser profile used for upstream requests. |
 | `DEFAULT_EMULATION_OS` | `windows` | Platform that profile presents as. |
-| `PROXY_URL` | *(none)* | Route all upstream requests through this HTTP/HTTPS proxy, e.g. `http://user:pass@host:port`. Unset means direct connections. |
+| `PROXY_URL` | *(none)* | Route upstream requests through this HTTP/HTTPS proxy, e.g. `http://user:pass@host:port`. Unset means direct connections. |
+| `PROXY_MODE` | `always` | With `PROXY_URL` set: `always` proxies everything; `fallback` goes direct until a host 429s, then proxies just that host. |
 | `RUST_LOG` | `hls_proxy=info` | Log filter. |
 
 Set `BASE_URL` when you deploy behind a domain:
@@ -177,6 +178,34 @@ redacted `scheme://host:port` is ever logged. A malformed `PROXY_URL` fails at
 startup rather than quietly falling back to direct connections. Only `http` and
 `https` proxies are supported. To spread load across several IPs, run one
 instance per proxy, or put a rotating proxy behind a single `PROXY_URL`.
+
+#### `always` vs `fallback`
+
+For live HLS the playlist is refreshed every few seconds and every segment is on
+the critical path, so an always-on proxy hop adds latency to requests that mostly
+would have succeeded direct. `PROXY_MODE=fallback` avoids that: it sends requests
+**direct** and only diverts a host to the proxy once that host actually returns a
+`429`.
+
+```bash
+PROXY_URL="http://user:pass@185.135.11.34:6033" PROXY_MODE=fallback hls-proxy
+```
+
+How fallback behaves:
+
+- A direct `429` is **retried once through the proxy**, so the viewer still gets
+  the segment — they never see the rate limit.
+- That host is then routed through the proxy for a cooldown (30s, doubling on
+  each repeat, capped at 15 min; a `Retry-After` header is honored if longer).
+  Other hosts are unaffected.
+- When the cooldown lapses, a **single** request probes direct while the rest
+  keep using the proxy. If it succeeds, the host returns to direct; if it 429s,
+  the cooldown escalates. This keeps a recovering host from triggering a
+  thundering herd of concurrent probes that all get rate-limited at once.
+
+Use `always` (the default) when hiding your origin server's IP from the provider
+matters more than per-request latency — in `fallback` mode the provider sees your
+real IP whenever it isn't rate-limiting you.
 
 Deployment guides for systemd, Docker, nginx and Caddy:
 **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**.
