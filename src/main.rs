@@ -68,7 +68,26 @@ async fn main() {
     let default_emulation_os =
         std::env::var("DEFAULT_EMULATION_OS").unwrap_or_else(|_| DEFAULT_EMULATION_OS.to_string());
 
-    let clients = match ClientPool::new(&default_emulation, &default_emulation_os) {
+    // An unset PROXY_URL means direct connections; an invalid one is a
+    // deployment mistake we surface at boot rather than silently ignoring, since
+    // falling back to direct is exactly what the proxy was meant to avoid.
+    let proxy_url = std::env::var("PROXY_URL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
+    let proxy = match &proxy_url {
+        Some(raw) => match client::parse_proxy(raw) {
+            Ok(proxy) => Some(proxy),
+            Err(err) => {
+                eprintln!("invalid PROXY_URL: {err}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
+    let clients = match ClientPool::new(&default_emulation, &default_emulation_os, proxy) {
         Ok(pool) => Arc::new(pool),
         Err(err) => {
             eprintln!("failed to initialise http client: {err}");
@@ -111,6 +130,11 @@ async fn main() {
         base_url = state.base_url.as_deref().unwrap_or("<from request host>"),
         emulation = state.clients.default_profile().browser,
         emulation_os = state.clients.default_profile().os,
+        proxy = proxy_url
+            .as_deref()
+            .map(client::redact_proxy)
+            .as_deref()
+            .unwrap_or("<none>"),
         "hls-proxy listening"
     );
 
@@ -135,7 +159,9 @@ mod tests {
 
     fn state(base: Option<&str>) -> AppState {
         AppState {
-            clients: Arc::new(ClientPool::new(DEFAULT_EMULATION, DEFAULT_EMULATION_OS).unwrap()),
+            clients: Arc::new(
+                ClientPool::new(DEFAULT_EMULATION, DEFAULT_EMULATION_OS, None).unwrap(),
+            ),
             base_url: base.map(str::to_string),
         }
     }
