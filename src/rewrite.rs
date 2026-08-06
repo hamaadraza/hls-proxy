@@ -45,14 +45,18 @@ pub fn rewrite_playlist(
             // EXT-X-SESSION-KEY, EXT-X-PART, EXT-X-PRELOAD-HINT and anything
             // later that follows the same URI="..." convention.
             if trimmed.contains("URI=\"") {
+                let upper = trimmed.to_ascii_uppercase();
                 // Only media-carrying tags may go direct; keys and playlist
                 // pointers stay proxied.
-                let uri_origin = direct_origin.filter(|_| tag_carries_media(trimmed));
+                let uri_origin = direct_origin.filter(|_| tag_carries_media(&upper));
+                let relative = tag_requires_relative_uri(&upper);
                 let replaced = uri_attr_re().replace_all(line, |caps: &Captures| {
-                    format!(
-                        "URI=\"{}\"",
+                    let rewritten = if relative {
+                        relative_proxy_uri(&caps[1], base, payload)
+                    } else {
                         rewrite_uri(&caps[1], base, payload, proxy_base, uri_origin)
-                    )
+                    };
+                    format!("URI=\"{rewritten}\"")
                 });
                 out.push_str(&replaced);
             } else {
@@ -81,11 +85,37 @@ pub fn rewrite_playlist(
 /// Whether a `URI="..."` tag points at media bytes (eligible for direct serving)
 /// rather than a key or a nested playlist. Unknown tags are treated as not media,
 /// so the conservative proxied path is the default.
-fn tag_carries_media(trimmed: &str) -> bool {
-    let upper = trimmed.to_ascii_uppercase();
+fn tag_carries_media(upper: &str) -> bool {
     upper.starts_with("#EXT-X-MAP")
         || upper.starts_with("#EXT-X-PART:")
         || upper.starts_with("#EXT-X-PRELOAD-HINT")
+}
+
+/// `EXT-X-RENDITION-REPORT`'s URI *must* be relative to the playlist containing
+/// it (RFC 8216bis §4.4.5.4), so the absolute proxy URL used everywhere else
+/// would make the tag invalid and strict LL-HLS clients may reject it.
+fn tag_requires_relative_uri(upper: &str) -> bool {
+    upper.starts_with("#EXT-X-RENDITION-REPORT")
+}
+
+/// A proxied URI expressed relative to the playlist's own proxy URL.
+///
+/// Playlists are served as `{base}/proxy/{token}`, so a bare token resolves
+/// against that by replacing the last path segment — landing on
+/// `{base}/proxy/{other token}`, exactly where the absolute form would have
+/// pointed, while staying the relative URI the spec demands. This also survives a
+/// `BASE_URL` with a path prefix, and the client appending query directives.
+fn relative_proxy_uri(raw: &str, base: &Url, payload: &StreamPayload) -> String {
+    if raw.is_empty() || raw.starts_with("data:") {
+        return raw.to_string();
+    }
+
+    match base.join(raw) {
+        Ok(absolute) if matches!(absolute.scheme(), "http" | "https") => {
+            payload.with_url(absolute.as_str()).encode()
+        }
+        _ => raw.to_string(),
+    }
 }
 
 fn rewrite_uri(
@@ -393,6 +423,56 @@ mod tests {
         let out = rewrite_playlist(input, &base(), &payload(), PROXY, None);
         let target = decoded_target(out.lines().nth(2).unwrap());
         assert_eq!(target.url, "https://cdn.test/1.ts");
+    }
+
+    /// The spec requires this URI to be relative, and a bare token is: resolved
+    /// against the playlist's own `{base}/proxy/{token}` URL it lands on the
+    /// proxied rendition, which is where the absolute form pointed.
+    #[test]
+    fn rendition_report_uri_stays_relative_and_still_resolves() {
+        let input = "#EXTM3U\n#EXT-X-RENDITION-REPORT:URI=\"../720p/index.m3u8\",LAST-MSN=42\n";
+        let out = rewrite_playlist(input, &base(), &payload(), PROXY, None);
+        let line = out.lines().nth(1).unwrap();
+
+        let uri = line
+            .split("URI=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        assert!(
+            !uri.contains('/') && !uri.starts_with("http"),
+            "must be a bare relative token, got {uri}"
+        );
+        assert!(line.ends_with(",LAST-MSN=42"), "other attributes survive");
+
+        // It points where the absolute form would have.
+        assert_eq!(
+            decoded_target(uri).url,
+            "https://origin.test/720p/index.m3u8"
+        );
+
+        // And a player resolving it against the playlist URL we served lands on
+        // the proxied rendition.
+        let served_at = Url::parse(&format!("{PROXY}/proxy/{}", payload().encode())).unwrap();
+        assert_eq!(
+            served_at.join(uri).unwrap().as_str(),
+            format!("{PROXY}/proxy/{uri}")
+        );
+    }
+
+    /// The same resolution has to hold when the proxy is mounted under a path
+    /// prefix and the client appended blocking-reload directives.
+    #[test]
+    fn relative_rendition_uri_survives_prefixes_and_query() {
+        let token = payload().encode();
+        let served_at =
+            Url::parse(&format!("https://host.test/hls/proxy/{token}?_HLS_msn=9")).unwrap();
+        assert_eq!(
+            served_at.join("OTHERTOKEN").unwrap().as_str(),
+            "https://host.test/hls/proxy/OTHERTOKEN"
+        );
     }
 
     #[test]

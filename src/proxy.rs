@@ -210,10 +210,11 @@ fn build_encode_response(
 pub async fn proxy(
     State(state): State<AppState>,
     Path(token): Path<String>,
+    Query(params): Query<Vec<(String, String)>>,
     req_headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let payload = StreamPayload::decode(&token)?;
-    let target = payload.parsed_url()?;
+    let target = with_delivery_directives(payload.parsed_url()?, &params);
 
     let upstream = fetch_upstream(&state, &payload, &target, &req_headers).await?;
 
@@ -554,6 +555,63 @@ async fn decide_direct_origin(
         SegmentPolicy::Direct => Some(segment),
         SegmentPolicy::Proxy => None,
     }
+}
+
+/// The Delivery Directives an LL-HLS client appends to a playlist URL to make
+/// the server hold the response until a given segment or part exists
+/// (RFC 8216bis §6.2.5.2).
+const HLS_DIRECTIVES: [&str; 4] = ["_HLS_msn", "_HLS_part", "_HLS_skip", "_HLS_report"];
+
+fn is_delivery_directive(name: &str) -> bool {
+    HLS_DIRECTIVES
+        .iter()
+        .any(|directive| name.eq_ignore_ascii_case(directive))
+}
+
+/// Carry an LL-HLS client's blocking-reload directives through to the upstream.
+///
+/// The token fixes the upstream URL, so without this the directives are dropped
+/// and upstream answers immediately with the playlist it already has. The client
+/// then sees no new parts and reloads again at once — the busy-poll that blocking
+/// reload exists to prevent.
+///
+/// Only the spec's directives are forwarded, never the whole query string: the
+/// rest of the URL comes from the signed token, and letting a caller append
+/// arbitrary parameters to an upstream request would hand them influence over a
+/// URL they are not supposed to control.
+fn with_delivery_directives(mut target: Url, params: &[(String, String)]) -> Url {
+    let directives: Vec<&(String, String)> = params
+        .iter()
+        .filter(|(name, _)| is_delivery_directive(name))
+        .collect();
+    if directives.is_empty() {
+        return target;
+    }
+
+    // Anything the token already carried is kept, minus any directive of the
+    // same name, so a reload can't accumulate duplicates upstream.
+    let carried: Vec<(String, String)> = target
+        .query_pairs()
+        .filter(|(name, _)| !is_delivery_directive(name))
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect();
+
+    {
+        let mut query = target.query_pairs_mut();
+        query.clear();
+        for (name, value) in &carried {
+            query.append_pair(name, value);
+        }
+        for (name, value) in directives {
+            query.append_pair(name, value);
+        }
+    }
+
+    // `query_pairs_mut` leaves a bare `?` behind when everything was cleared.
+    if target.query() == Some("") {
+        target.set_query(None);
+    }
+    target
 }
 
 /// The origin a browser will send when it fetches the segments, or `None` for a
@@ -1349,6 +1407,73 @@ mod tests {
             direct_origin_for(&auto_state(), addr, &same_origin_browser).await,
             None,
             "a same-origin browser still needs CORS on the CDN"
+        );
+    }
+
+    // ---- LL-HLS delivery directives ----
+
+    fn directives(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// Without these forwarded, upstream answers immediately and the LL-HLS
+    /// client busy-polls instead of blocking.
+    #[test]
+    fn blocking_reload_directives_reach_upstream() {
+        let target = url("https://cdn.test/live/media.m3u8");
+        let out = with_delivery_directives(
+            target,
+            &directives(&[("_HLS_msn", "42"), ("_HLS_part", "3")]),
+        );
+        assert_eq!(
+            out.as_str(),
+            "https://cdn.test/live/media.m3u8?_HLS_msn=42&_HLS_part=3"
+        );
+    }
+
+    /// The token owns the upstream URL; a caller must not be able to bolt on
+    /// parameters of their choosing.
+    #[test]
+    fn only_spec_directives_are_forwarded() {
+        let target = url("https://cdn.test/media.m3u8?token=abc");
+        let out = with_delivery_directives(
+            target,
+            &directives(&[("_HLS_msn", "7"), ("evil", "1"), ("token", "stolen")]),
+        );
+        assert_eq!(
+            out.as_str(),
+            "https://cdn.test/media.m3u8?token=abc&_HLS_msn=7"
+        );
+    }
+
+    /// A URL that already carries a directive must not end up with two.
+    #[test]
+    fn directives_do_not_accumulate() {
+        let target = url("https://cdn.test/media.m3u8?_HLS_msn=1&keep=yes");
+        let out = with_delivery_directives(target, &directives(&[("_HLS_msn", "2")]));
+        assert_eq!(
+            out.as_str(),
+            "https://cdn.test/media.m3u8?keep=yes&_HLS_msn=2"
+        );
+    }
+
+    /// A plain segment request has no directives and must come through untouched,
+    /// bare `?` included.
+    #[test]
+    fn requests_without_directives_are_unchanged() {
+        let target = url("https://cdn.test/1.ts");
+        assert_eq!(
+            with_delivery_directives(target, &[]).as_str(),
+            "https://cdn.test/1.ts"
+        );
+
+        let signed = url("https://cdn.test/1.ts?sig=xyz");
+        assert_eq!(
+            with_delivery_directives(signed, &directives(&[("other", "1")])).as_str(),
+            "https://cdn.test/1.ts?sig=xyz"
         );
     }
 

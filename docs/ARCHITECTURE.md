@@ -234,6 +234,24 @@ requests, which is precisely the deployment `BASE_URL` exists to serve, so
 "native player" would skip the CORS requirement for exactly the setup most likely
 to need it.
 
+### Low-latency HLS
+
+Two details make LL-HLS work through the rewrite:
+
+- **Delivery directives are forwarded.** A client appends `_HLS_msn`,
+  `_HLS_part`, `_HLS_skip` or `_HLS_report` to a playlist URL to make the server
+  hold the response until that part exists. The token fixes the upstream URL, so
+  those have to be carried across explicitly or upstream answers immediately and
+  the client busy-polls — the exact behaviour blocking reload exists to avoid.
+  Only the spec's directives are forwarded: the rest of the URL comes from the
+  token, and letting a caller append arbitrary parameters would give them
+  influence over a URL they don't control.
+- **`EXT-X-RENDITION-REPORT` keeps a relative URI**, which RFC 8216bis §4.4.5.4
+  requires. Playlists are served as `{base}/proxy/{token}`, so emitting a bare
+  token resolves against that by replacing the last path segment — landing on the
+  proxied rendition exactly as the absolute form would, while staying relative.
+  That holds under a `BASE_URL` path prefix and with query directives appended.
+
 ### Browser-identical upstream requests
 
 Upstream requests go out through [wreq](https://github.com/0x676e67/wreq), which
