@@ -297,9 +297,22 @@ pub async fn proxy(
             }
 
             let text = String::from_utf8_lossy(&bytes);
-            let policy =
-                resolve_segment_policy(&state, &payload, &text, &final_url, &req_headers).await;
-            let rewritten = rewrite_playlist(&text, &final_url, &payload, &proxy_base, policy);
+            let direct_host = resolve_direct_host(
+                &state,
+                &payload,
+                &text,
+                &final_url,
+                &req_headers,
+                &proxy_base,
+            )
+            .await;
+            let rewritten = rewrite_playlist(
+                &text,
+                &final_url,
+                &payload,
+                &proxy_base,
+                direct_host.as_deref(),
+            );
 
             let mut response = Response::builder().status(status);
             let headers = response.headers_mut().unwrap();
@@ -450,41 +463,56 @@ fn build_upstream_request(
     request
 }
 
-/// Decide whether a media playlist's segments may be served direct.
+/// The host whose segments may be served direct, or `None` to proxy everything.
 ///
 /// Only relevant in `SEGMENT_MODE=auto`, and only for media playlists (a master
 /// is all sub-playlists, which always stay proxied). Asks the per-host prober,
 /// running one probe against the first segment when the cache is cold. The probe
 /// uses the *direct* client — it simulates the viewer, who never has our proxy.
-async fn resolve_segment_policy(
+///
+/// The returned host scopes the rewrite: segments on any other CDN in the same
+/// playlist stay proxied, since only this host was actually tested.
+async fn resolve_direct_host(
     state: &AppState,
     payload: &StreamPayload,
     text: &str,
     final_url: &Url,
     req_headers: &HeaderMap,
-) -> SegmentPolicy {
+    proxy_base: &str,
+) -> Option<String> {
     if state.segment_mode != SegmentMode::Auto {
-        return SegmentPolicy::Proxy;
+        return None;
     }
 
-    let Some(segment) = first_segment(text, final_url) else {
-        // Not a media playlist, or no usable segment to probe: keep proxying.
-        return SegmentPolicy::Proxy;
-    };
+    // Not a media playlist, or no usable segment to probe: keep proxying.
+    let segment = first_segment(text, final_url)?;
 
-    let host = segment.host_str().unwrap_or_default().to_string();
+    // A plaintext segment on an https page is blocked as mixed content by every
+    // browser, and the player would fail with no useful error. Relaying it over
+    // our own TLS is the only thing that can work, so don't offer it directly.
+    if segment.scheme() == "http" && proxy_base.starts_with("https://") {
+        tracing::debug!(url = %segment, "segment is http on an https origin; keeping it proxied");
+        return None;
+    }
+
+    let host = segment.host_str()?.to_string();
     let origin = req_headers
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok());
     let now = Instant::now();
 
-    match state.prober.decide(&host, origin, now) {
+    let policy = match state.prober.decide(&host, origin, now) {
         Plan::Use(policy) => policy,
         Plan::Probe => {
             let observation = probe_segment(state, payload, &segment, origin).await;
             tracing::info!(%host, direct = observation.fetchable, "probed segment host");
             state.prober.record(&host, observation, origin, now)
         }
+    };
+
+    match policy {
+        SegmentPolicy::Direct => Some(host),
+        SegmentPolicy::Proxy => None,
     }
 }
 
@@ -574,6 +602,7 @@ async fn probe_segment(
     Observation {
         fetchable: fetchable_status && !is_html,
         allow_origin,
+        probed_with_origin: origin.is_some(),
     }
 }
 
@@ -1004,11 +1033,13 @@ mod tests {
         format!("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\n{segment}\n")
     }
 
-    async fn policy_for(
+    /// Runs the policy decision against a local segment host, returning the host
+    /// cleared for direct serving (or `None` when everything stays proxied).
+    async fn direct_host_for(
         state: &AppState,
         addr: std::net::SocketAddr,
         headers: &HeaderMap,
-    ) -> SegmentPolicy {
+    ) -> Option<String> {
         let text = media_playlist(&format!("http://{addr}/seg"));
         let base = Url::parse(&format!("http://{addr}/live/media.m3u8")).unwrap();
         let payload = StreamPayload {
@@ -1017,31 +1048,75 @@ mod tests {
             emulation: None,
             os: None,
         };
-        resolve_segment_policy(state, &payload, &text, &base, headers).await
+        // An http proxy base keeps the mixed-content guard out of the way; it has
+        // its own test below.
+        resolve_direct_host(
+            state,
+            &payload,
+            &text,
+            &base,
+            headers,
+            "http://localhost:8080",
+        )
+        .await
     }
 
     /// A fetchable segment with no CORS goes direct for a native player.
     #[tokio::test]
     async fn auto_serves_open_segments_direct() {
         let addr = segment_host(StatusCode::PARTIAL_CONTENT, None, "video/mp2t").await;
-        let policy = policy_for(&auto_state(), addr, &HeaderMap::new()).await;
-        assert_eq!(policy, SegmentPolicy::Direct);
+        let host = direct_host_for(&auto_state(), addr, &HeaderMap::new()).await;
+        assert_eq!(host.as_deref(), Some(addr.ip().to_string().as_str()));
     }
 
     /// A segment that refuses the anonymous, header-less fetch stays proxied.
     #[tokio::test]
     async fn auto_proxies_gated_segments() {
         let addr = segment_host(StatusCode::FORBIDDEN, None, "text/plain").await;
-        let policy = policy_for(&auto_state(), addr, &HeaderMap::new()).await;
-        assert_eq!(policy, SegmentPolicy::Proxy);
+        assert_eq!(
+            direct_host_for(&auto_state(), addr, &HeaderMap::new()).await,
+            None
+        );
+    }
+
+    /// A plaintext segment on an https-served playlist would be blocked by the
+    /// browser as mixed content, so it must stay proxied over our own TLS.
+    #[tokio::test]
+    async fn auto_keeps_http_segments_proxied_on_https_origins() {
+        let addr = segment_host(StatusCode::OK, Some("*"), "video/mp2t").await;
+        let state = auto_state();
+        let text = media_playlist(&format!("http://{addr}/seg"));
+        let base = Url::parse(&format!("http://{addr}/live/media.m3u8")).unwrap();
+        let payload = StreamPayload {
+            url: base.to_string(),
+            headers: BTreeMap::new(),
+            emulation: None,
+            os: None,
+        };
+
+        let host = resolve_direct_host(
+            &state,
+            &payload,
+            &text,
+            &base,
+            &HeaderMap::new(),
+            "https://hls-proxy.example.com",
+        )
+        .await;
+        assert_eq!(
+            host, None,
+            "http segments must not be offered to an https page"
+        );
     }
 
     /// A 200 that is really an HTML error page is a soft failure, so it proxies.
     #[tokio::test]
     async fn auto_proxies_html_soft_failures() {
         let addr = segment_host(StatusCode::OK, None, "text/html; charset=utf-8").await;
-        let policy = policy_for(&auto_state(), addr, &HeaderMap::new()).await;
-        assert_eq!(policy, SegmentPolicy::Proxy);
+        assert_eq!(
+            direct_host_for(&auto_state(), addr, &HeaderMap::new()).await,
+            None
+        );
     }
 
     /// A browser player (Origin present) needs CORS: without it, proxy; with a
@@ -1056,14 +1131,38 @@ mod tests {
 
         let no_cors = segment_host(StatusCode::OK, None, "video/mp2t").await;
         assert_eq!(
-            policy_for(&auto_state(), no_cors, &browser).await,
-            SegmentPolicy::Proxy
+            direct_host_for(&auto_state(), no_cors, &browser).await,
+            None
         );
 
         let cors = segment_host(StatusCode::OK, Some("*"), "video/mp2t").await;
-        assert_eq!(
-            policy_for(&auto_state(), cors, &browser).await,
-            SegmentPolicy::Direct
+        assert!(direct_host_for(&auto_state(), cors, &browser)
+            .await
+            .is_some());
+    }
+
+    /// A host first probed by a native player (no `Origin`, so the CDN sent no
+    /// CORS headers) must be re-probed when a browser shows up, or browsers would
+    /// never benefit from the mode on a mixed-client deployment.
+    #[tokio::test]
+    async fn a_native_probe_does_not_bury_the_cors_answer_for_browsers() {
+        let addr = segment_host(StatusCode::OK, Some("*"), "video/mp2t").await;
+        let state = auto_state();
+
+        // Native client probes first: the CDN echoes no CORS, so none is cached.
+        assert!(direct_host_for(&state, addr, &HeaderMap::new())
+            .await
+            .is_some());
+
+        // A browser then arrives and must still be able to reach the direct path.
+        let mut browser = HeaderMap::new();
+        browser.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://player.test"),
+        );
+        assert!(
+            direct_host_for(&state, addr, &browser).await.is_some(),
+            "a browser must trigger a CORS re-probe rather than inherit a blind verdict"
         );
     }
 
@@ -1079,8 +1178,16 @@ mod tests {
             emulation: None,
             os: None,
         };
-        let policy = resolve_segment_policy(&state, &payload, text, &base, &HeaderMap::new()).await;
-        assert_eq!(policy, SegmentPolicy::Proxy);
+        let host = resolve_direct_host(
+            &state,
+            &payload,
+            text,
+            &base,
+            &HeaderMap::new(),
+            "http://localhost:8080",
+        )
+        .await;
+        assert_eq!(host, None);
     }
 
     /// `SEGMENT_MODE=proxy` (the default) never probes and always proxies, even
@@ -1090,9 +1197,6 @@ mod tests {
         let addr = segment_host(StatusCode::OK, Some("*"), "video/mp2t").await;
         let mut state = auto_state();
         state.segment_mode = SegmentMode::Proxy;
-        assert_eq!(
-            policy_for(&state, addr, &HeaderMap::new()).await,
-            SegmentPolicy::Proxy
-        );
+        assert_eq!(direct_host_for(&state, addr, &HeaderMap::new()).await, None);
     }
 }

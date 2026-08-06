@@ -1,5 +1,4 @@
 use crate::payload::StreamPayload;
-use crate::probe::SegmentPolicy;
 use regex::{Captures, Regex};
 use std::sync::OnceLock;
 use url::Url;
@@ -16,20 +15,23 @@ fn uri_attr_re() -> &'static Regex {
 /// vendor tags and malformed lines that a strict parser rejects, and anything
 /// we don't recognise should pass through untouched rather than break playback.
 ///
-/// Under [`SegmentPolicy::Direct`] the actual media bytes — bare segment lines
+/// When `direct_host` is set, media bytes on **that host** — bare segment lines
 /// and the media-carrying `URI="..."` tags (`EXT-X-MAP`, `EXT-X-PART`,
 /// `EXT-X-PRELOAD-HINT`) — are emitted as their absolute upstream URLs so the
 /// player fetches them straight from the CDN. Everything that is our point of
 /// control still routes through the proxy: nested playlists (anything resolving
 /// to `.m3u8`), rendition/I-frame `URI`s, and decryption keys.
+///
+/// The host scoping matters: only the probed host is known to serve its segments
+/// openly, so a playlist that interleaves segments from another CDN keeps those
+/// proxied rather than assuming the verdict transfers.
 pub fn rewrite_playlist(
     body: &str,
     base: &Url,
     payload: &StreamPayload,
     proxy_base: &str,
-    policy: SegmentPolicy,
+    direct_host: Option<&str>,
 ) -> String {
-    let direct = policy == SegmentPolicy::Direct;
     let mut out = String::with_capacity(body.len() * 2);
 
     for line in body.lines() {
@@ -44,11 +46,11 @@ pub fn rewrite_playlist(
             if trimmed.contains("URI=\"") {
                 // Only media-carrying tags may go direct; keys and playlist
                 // pointers stay proxied.
-                let uri_direct = direct && tag_carries_media(trimmed);
+                let uri_host = direct_host.filter(|_| tag_carries_media(trimmed));
                 let replaced = uri_attr_re().replace_all(line, |caps: &Captures| {
                     format!(
                         "URI=\"{}\"",
-                        rewrite_uri(&caps[1], base, payload, proxy_base, uri_direct)
+                        rewrite_uri(&caps[1], base, payload, proxy_base, uri_host)
                     )
                 });
                 out.push_str(&replaced);
@@ -60,7 +62,13 @@ pub fn rewrite_playlist(
             // direct policy it's a segment (masters are never probed), but the
             // playlist-extension guard in rewrite_uri keeps any stray nested
             // playlist proxied regardless.
-            out.push_str(&rewrite_uri(trimmed, base, payload, proxy_base, direct));
+            out.push_str(&rewrite_uri(
+                trimmed,
+                base,
+                payload,
+                proxy_base,
+                direct_host,
+            ));
         }
 
         out.push('\n');
@@ -84,7 +92,7 @@ fn rewrite_uri(
     base: &Url,
     payload: &StreamPayload,
     proxy_base: &str,
-    direct: bool,
+    direct_host: Option<&str>,
 ) -> String {
     // Inline keys use data: URIs and must stay as they are.
     if raw.is_empty() || raw.starts_with("data:") {
@@ -93,9 +101,7 @@ fn rewrite_uri(
 
     match base.join(raw) {
         Ok(absolute) if matches!(absolute.scheme(), "http" | "https") => {
-            // A nested playlist is our only lever once segments go direct, so it
-            // is always proxied even under the direct policy.
-            if direct && !has_playlist_extension(&absolute) {
+            if may_serve_direct(&absolute, direct_host) {
                 absolute.to_string()
             } else {
                 proxied_url(proxy_base, &payload.with_url(absolute.as_str()))
@@ -103,6 +109,19 @@ fn rewrite_uri(
         }
         _ => raw.to_string(),
     }
+}
+
+/// Whether one resolved URI may be handed to the player directly: it has to live
+/// on the host we actually probed, and it must not be a nested playlist — those
+/// are our only lever once segments bypass us, so they stay proxied.
+fn may_serve_direct(absolute: &Url, direct_host: Option<&str>) -> bool {
+    let Some(direct_host) = direct_host else {
+        return false;
+    };
+    absolute
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case(direct_host))
+        && !has_playlist_extension(absolute)
 }
 
 pub fn proxied_url(proxy_base: &str, payload: &StreamPayload) -> String {
@@ -177,7 +196,7 @@ mod tests {
     #[test]
     fn rewrites_relative_variant_playlists() {
         let input = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\n720p/index.m3u8\n";
-        let out = rewrite_playlist(input, &base(), &payload(), PROXY, SegmentPolicy::Proxy);
+        let out = rewrite_playlist(input, &base(), &payload(), PROXY, None);
         let line = out.lines().nth(2).unwrap();
 
         assert!(line.starts_with("https://hls-proxy.example.com/proxy/"));
@@ -193,7 +212,7 @@ mod tests {
     #[test]
     fn rewrites_absolute_segment_urls() {
         let input = "#EXTM3U\n#EXTINF:6.0,\nhttps://cdn.test/s/1.ts\n";
-        let out = rewrite_playlist(input, &base(), &payload(), PROXY, SegmentPolicy::Proxy);
+        let out = rewrite_playlist(input, &base(), &payload(), PROXY, None);
         let target = decoded_target(out.lines().nth(2).unwrap());
         assert_eq!(target.url, "https://cdn.test/s/1.ts");
     }
@@ -207,7 +226,7 @@ mod tests {
             "#EXTINF:4.0,\n",
             "seg1.m4s\n"
         );
-        let out = rewrite_playlist(input, &base(), &payload(), PROXY, SegmentPolicy::Proxy);
+        let out = rewrite_playlist(input, &base(), &payload(), PROXY, None);
 
         let key_line = out.lines().nth(1).unwrap();
         assert!(key_line
@@ -242,7 +261,7 @@ mod tests {
     #[test]
     fn rewrites_multiple_uris_on_one_line() {
         let input = "#EXT-X-MEDIA:TYPE=AUDIO,URI=\"a/audio.m3u8\",GROUP-ID=\"aud\"\n";
-        let out = rewrite_playlist(input, &base(), &payload(), PROXY, SegmentPolicy::Proxy);
+        let out = rewrite_playlist(input, &base(), &payload(), PROXY, None);
         assert_eq!(
             out.matches("https://hls-proxy.example.com/proxy/").count(),
             1
@@ -258,7 +277,7 @@ mod tests {
             "#EXT-X-KEY:METHOD=AES-128,URI=\"data:text/plain;base64,AAAA\"\n",
             "#EXT-X-ENDLIST\n"
         );
-        let out = rewrite_playlist(input, &base(), &payload(), PROXY, SegmentPolicy::Proxy);
+        let out = rewrite_playlist(input, &base(), &payload(), PROXY, None);
         assert!(out.contains("#EXT-X-VERSION:3"));
         assert!(out.contains("URI=\"data:text/plain;base64,AAAA\""));
         assert!(!out.contains("/proxy/"));
@@ -267,7 +286,7 @@ mod tests {
     #[test]
     fn preserves_comments_and_blank_lines() {
         let input = "#EXTM3U\n\n#EXT-X-TARGETDURATION:6\n\nseg.ts\n";
-        let out = rewrite_playlist(input, &base(), &payload(), PROXY, SegmentPolicy::Proxy);
+        let out = rewrite_playlist(input, &base(), &payload(), PROXY, None);
         assert_eq!(out.lines().count(), 5);
         assert_eq!(out.lines().nth(1).unwrap(), "");
     }
@@ -276,15 +295,39 @@ mod tests {
     /// upstream URLs — never relative (which would resolve against our origin).
     #[test]
     fn direct_policy_emits_absolute_segment_urls() {
-        let input = "#EXTM3U\n#EXTINF:6.0,\nseg/1.ts\n#EXTINF:6.0,\nhttps://cdn.test/2.ts\n";
-        let out = rewrite_playlist(input, &base(), &payload(), PROXY, SegmentPolicy::Direct);
+        let input = "#EXTM3U\n#EXTINF:6.0,\nseg/1.ts\n#EXTINF:6.0,\nhttps://origin.test/2.ts\n";
+        let out = rewrite_playlist(input, &base(), &payload(), PROXY, Some("origin.test"));
         let lines: Vec<&str> = out.lines().collect();
 
         // Relative segment resolved against the playlist's own URL.
         assert_eq!(lines[2], "https://origin.test/live/seg/1.ts");
-        // Absolute segment passed straight through.
-        assert_eq!(lines[4], "https://cdn.test/2.ts");
+        // Absolute segment on the same host passed straight through.
+        assert_eq!(lines[4], "https://origin.test/2.ts");
         assert!(!out.contains("/proxy/"));
+    }
+
+    /// The verdict belongs to the host we probed. A playlist that interleaves
+    /// segments from another CDN must keep those proxied — that host was never
+    /// tested and may well be gated.
+    #[test]
+    fn direct_policy_is_scoped_to_the_probed_host() {
+        let input = concat!(
+            "#EXTM3U\n",
+            "#EXTINF:6.0,\n",
+            "https://origin.test/1.ts\n",
+            "#EXTINF:6.0,\n",
+            "https://other-cdn.test/2.ts\n"
+        );
+        let out = rewrite_playlist(input, &base(), &payload(), PROXY, Some("origin.test"));
+        let lines: Vec<&str> = out.lines().collect();
+
+        assert_eq!(lines[2], "https://origin.test/1.ts");
+        assert!(
+            lines[4].starts_with("https://hls-proxy.example.com/proxy/"),
+            "an unprobed host must stay proxied, got {}",
+            lines[4]
+        );
+        assert_eq!(decoded_target(lines[4]).url, "https://other-cdn.test/2.ts");
     }
 
     /// Keys and nested playlists stay proxied even when segments go direct; the
@@ -299,7 +342,7 @@ mod tests {
             "seg1.m4s\n",
             "#EXT-X-MEDIA:TYPE=AUDIO,URI=\"audio/a.m3u8\",GROUP-ID=\"aud\"\n"
         );
-        let out = rewrite_playlist(input, &base(), &payload(), PROXY, SegmentPolicy::Direct);
+        let out = rewrite_playlist(input, &base(), &payload(), PROXY, Some("origin.test"));
         let lines: Vec<&str> = out.lines().collect();
 
         // Key material is never handed out directly.
@@ -320,7 +363,7 @@ mod tests {
     #[test]
     fn proxy_policy_rewrites_segments_as_before() {
         let input = "#EXTM3U\n#EXTINF:6.0,\nhttps://cdn.test/1.ts\n";
-        let out = rewrite_playlist(input, &base(), &payload(), PROXY, SegmentPolicy::Proxy);
+        let out = rewrite_playlist(input, &base(), &payload(), PROXY, None);
         let target = decoded_target(out.lines().nth(2).unwrap());
         assert_eq!(target.url, "https://cdn.test/1.ts");
     }

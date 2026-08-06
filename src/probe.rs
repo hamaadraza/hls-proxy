@@ -39,6 +39,10 @@ const NEGATIVE_TTL: Duration = Duration::from_secs(120); // 2 minutes
 /// after which the slot self-heals in case the prober never reported back.
 const PROBE_TTL: Duration = Duration::from_secs(15);
 
+/// Above this many tracked hosts, expired entries are swept out so a proxy
+/// serving many distinct CDN hosts can't grow the cache without bound.
+const MAX_ENTRIES: usize = 4096;
+
 /// What a probe observed about a host's first segment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Observation {
@@ -48,6 +52,10 @@ pub struct Observation {
     /// The raw `Access-Control-Allow-Origin` the probe saw, if any. Only consulted
     /// for browser players (requests that carry an `Origin`).
     pub allow_origin: Option<String>,
+    /// Whether the probe itself carried an `Origin`. A CDN that only emits CORS
+    /// headers in response to one would look CORS-less to a probe sent without,
+    /// so an observation made without an `Origin` cannot settle the CORS question.
+    pub probed_with_origin: bool,
 }
 
 impl Observation {
@@ -56,7 +64,14 @@ impl Observation {
         Self {
             fetchable: false,
             allow_origin: None,
+            probed_with_origin: false,
         }
+    }
+
+    /// True when this observation can't answer a browser's CORS question because
+    /// the probe that produced it never asked one.
+    fn cors_unresolved(&self) -> bool {
+        self.fetchable && self.allow_origin.is_none() && !self.probed_with_origin
     }
 }
 
@@ -110,7 +125,10 @@ impl SegmentProber {
         let mut hosts = self.hosts.lock().unwrap();
         if let Some(entry) = hosts.get(host) {
             if let Some(observation) = &entry.observation {
-                if now < entry.expires {
+                // A browser arriving after a probe that carried no `Origin` needs
+                // one re-probe to settle CORS; otherwise the cached verdict holds.
+                let unresolved = origin.is_some() && observation.cors_unresolved();
+                if now < entry.expires && !unresolved {
                     return Plan::Use(evaluate(observation, origin));
                 }
             }
@@ -154,8 +172,21 @@ impl SegmentProber {
                 probe_deadline: None,
             },
         );
+        prune(&mut hosts, now);
         policy
     }
+}
+
+/// Bounded-size housekeeping, mirroring the router's: once the map is large,
+/// drop entries whose verdict has expired and that have no probe outstanding.
+/// Without this a proxy serving many distinct CDN hosts would grow forever.
+fn prune(hosts: &mut HashMap<String, Entry>, now: Instant) {
+    if hosts.len() <= MAX_ENTRIES {
+        return;
+    }
+    hosts.retain(|_, entry| {
+        now < entry.expires || entry.probe_deadline.is_some_and(|deadline| now < deadline)
+    });
 }
 
 impl Default for SegmentProber {
@@ -194,10 +225,21 @@ fn cors_allows(allow_origin: Option<&str>, request_origin: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Probed without an `Origin`, so the CORS question is left open.
     fn open() -> Observation {
         Observation {
             fetchable: true,
             allow_origin: None,
+            probed_with_origin: false,
+        }
+    }
+
+    /// Probed with an `Origin` and told definitively that CORS is absent.
+    fn open_no_cors() -> Observation {
+        Observation {
+            fetchable: true,
+            allow_origin: None,
+            probed_with_origin: true,
         }
     }
 
@@ -205,6 +247,7 @@ mod tests {
         Observation {
             fetchable: true,
             allow_origin: Some(value.to_string()),
+            probed_with_origin: true,
         }
     }
 
@@ -217,7 +260,7 @@ mod tests {
     fn browser_needs_cors() {
         // No CORS header: a browser can't fetch it cross-origin, so proxy.
         assert_eq!(
-            evaluate(&open(), Some("https://player.test")),
+            evaluate(&open_no_cors(), Some("https://player.test")),
             SegmentPolicy::Proxy
         );
         // Wildcard covers everyone.
@@ -286,19 +329,48 @@ mod tests {
     fn the_verdict_is_evaluated_per_origin() {
         let prober = SegmentProber::new();
         let t0 = Instant::now();
-        prober.decide("cdn.test", None, t0);
-        // Probed by a native request; CDN advertised no CORS.
-        prober.record("cdn.test", open(), None, t0);
+        prober.decide("cdn.test", Some("https://player.test"), t0);
+        // Probed with an Origin, and the CDN definitively sent no CORS headers.
+        prober.record("cdn.test", open_no_cors(), Some("https://player.test"), t0);
 
-        // A native player still gets direct...
+        // A native player gets direct — it doesn't need CORS...
         assert_eq!(
             prober.decide("cdn.test", None, t0),
             Plan::Use(SegmentPolicy::Direct)
         );
-        // ...but a browser player is proxied, since CORS is unknown.
+        // ...but a browser player is proxied, since the CDN grants no origin.
         assert_eq!(
             prober.decide("cdn.test", Some("https://player.test"), t0),
             Plan::Use(SegmentPolicy::Proxy)
+        );
+    }
+
+    /// A verdict reached without an `Origin` can't answer a browser's CORS
+    /// question, so a browser must trigger exactly one re-probe rather than
+    /// inheriting a blind "no CORS" reading.
+    #[test]
+    fn a_browser_reprobes_a_verdict_taken_without_an_origin() {
+        let prober = SegmentProber::new();
+        let t0 = Instant::now();
+        prober.decide("cdn.test", None, t0);
+        prober.record("cdn.test", open(), None, t0);
+
+        // Native traffic keeps using the cached verdict.
+        assert_eq!(
+            prober.decide("cdn.test", None, t0),
+            Plan::Use(SegmentPolicy::Direct)
+        );
+        // The first browser re-probes, this time sending an Origin.
+        assert_eq!(
+            prober.decide("cdn.test", Some("https://player.test"), t0),
+            Plan::Probe
+        );
+
+        // Once that lands, the CORS answer is settled and no longer re-probed.
+        prober.record("cdn.test", open_cors("*"), Some("https://player.test"), t0);
+        assert_eq!(
+            prober.decide("cdn.test", Some("https://player.test"), t0),
+            Plan::Use(SegmentPolicy::Direct)
         );
     }
 
